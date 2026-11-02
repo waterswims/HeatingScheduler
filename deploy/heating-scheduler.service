@@ -1,0 +1,28 @@
+[Unit]
+Description=HeatingScheduler (Octopus Agile -> Wavin Sentio)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+User=heating
+Group=heating
+WorkingDirectory=/opt/heating-scheduler
+ExecStart=/opt/heating-scheduler/HeatingScheduler
+EnvironmentFile=/etc/heating-scheduler/env
+Environment=DOTNET_ENVIRONMENT=Production
+Restart=always
+RestartSec=30
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
