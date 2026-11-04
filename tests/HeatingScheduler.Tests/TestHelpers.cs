@@ -8,9 +8,11 @@ internal static class TestHelpers
 {
     public static IOptionsWrapper<T> Opt<T>(T value) where T : class => new(value);
 
-    /// <summary>Creates priced slots for every slot in <paramref name="day"/> using <paramref name="price"/>(index).</summary>
-    public static List<AgileSlot> SlotsFor(AgileDay day, Func<int, decimal> price) =>
-        day.SlotStarts().Select((s, i) => new AgileSlot(s, s + AgileDay.SlotLength, price(i))).ToList();
+    /// <summary>Creates <paramref name="count"/> consecutive priced slots from <paramref name="start"/> using <paramref name="price"/>(index).</summary>
+    public static List<AgileSlot> SlotsFrom(DateTimeOffset start, int count, Func<int, decimal> price) =>
+        Enumerable.Range(0, count)
+            .Select(i => new AgileSlot(start + i * Slots.Length, start + (i + 1) * Slots.Length, price(i)))
+            .ToList();
 }
 
 internal sealed class IOptionsWrapper<T>(T value) : Microsoft.Extensions.Options.IOptions<T> where T : class

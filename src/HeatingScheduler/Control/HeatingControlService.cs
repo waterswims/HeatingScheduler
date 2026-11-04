@@ -11,7 +11,7 @@ namespace HeatingScheduler.Control;
 /// </summary>
 public sealed class HeatingControlService(
     IWavinClient wavin,
-    HeatingSchedule schedule,
+    IHeatingSchedule schedule,
     IOptions<WavinOptions> wavinOptions,
     IOptions<HeatingOptions> heatingOptions,
     TimeProvider timeProvider,
@@ -56,7 +56,7 @@ public sealed class HeatingControlService(
     /// <summary>Wait until just after the next half-hour slot boundary, but never longer than MaxCheckIntervalMinutes.</summary>
     public TimeSpan NextDelay(DateTimeOffset now)
     {
-        var untilNextSlot = AgileDay.SlotStartFor(now) + AgileDay.SlotLength + SlotBoundaryDelay - now;
+        var untilNextSlot = Slots.StartFor(now) + Slots.Length + SlotBoundaryDelay - now;
         var max = TimeSpan.FromMinutes(heatingOptions.Value.MaxCheckIntervalMinutes);
         return untilNextSlot < max ? untilNextSlot : max;
     }
@@ -75,7 +75,7 @@ public sealed class HeatingControlService(
             }
             else
             {
-                logger.LogInformation("Heating should be {State} ({Target}°C) for slot starting {Slot:u}", desired.State, target, AgileDay.SlotStartFor(now));
+                logger.LogInformation("Heating should be {State} ({Target}°C) for slot starting {Slot:u}", desired.State, target, Slots.StartFor(now));
             }
 
             _lastDesired = desired;

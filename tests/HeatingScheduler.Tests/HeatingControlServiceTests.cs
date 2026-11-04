@@ -10,9 +10,7 @@ namespace HeatingScheduler.Tests;
 
 public class HeatingControlServiceTests
 {
-    private static readonly AgileDay Day = new(new DateOnly(2026, 11, 2));
-
-    private sealed class FakeWavin(params WavinDevice[] devices) : IWavinClient
+        private sealed class FakeWavin(params WavinDevice[] devices) : IWavinClient
     {
         public List<(string Device, IReadOnlyList<RoomSetpoint> Setpoints)> Sent { get; } = [];
 
@@ -49,26 +47,25 @@ public class HeatingControlServiceTests
         Platform = JsonSerializer.SerializeToElement("PLATFORM_LEGACY"),
     };
 
-    /// <summary>Builds a service whose schedule is ON for the first half of the day (slots 0–23) and OFF after.</summary>
-    private static HeatingControlService Create(FakeWavin wavin, DateTimeOffset now, WavinOptions? wavinOptions = null, bool withSchedule = true)
+    private sealed class FakeSchedule(DesiredState state) : IHeatingSchedule
     {
-        var schedule = new HeatingSchedule(TestHelpers.Opt(new ScheduleOptions { FallbackState = HeatingState.On }));
-        if (withSchedule)
-        {
-            schedule.SetDay(CheapestSlotSelector.Select(Day, TestHelpers.SlotsFor(Day, i => i), 50));
-        }
-
-        return new HeatingControlService(
-            wavin,
-            schedule,
-            TestHelpers.Opt(wavinOptions ?? new WavinOptions()),
-            TestHelpers.Opt(new HeatingOptions { OnTemperature = 21, OffTemperature = 17, MaxCheckIntervalMinutes = 5 }),
-            new FakeTimeProvider(now),
-            NullLogger<HeatingControlService>.Instance);
+        public DesiredState GetDesiredState(DateTimeOffset utcNow) => state;
+        public void MarkFirstAttemptComplete() { }
+        public Task WaitForFirstAttemptAsync(TimeSpan timeout, TimeProvider timeProvider, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
-    private static DateTimeOffset OnTime => Day.StartUtc.AddHours(1);
-    private static DateTimeOffset OffTime => Day.StartUtc.AddHours(20);
+    private static readonly DesiredState On = new(HeatingState.On, false);
+    private static readonly DesiredState Off = new(HeatingState.Off, false);
+    private static readonly DateTimeOffset Now = DateTimeOffset.Parse("2026-11-04T12:10:00Z");
+
+    private static HeatingControlService Create(FakeWavin wavin, DesiredState desired, WavinOptions? wavinOptions = null, DateTimeOffset? now = null) =>
+        new(
+            wavin,
+            new FakeSchedule(desired),
+            TestHelpers.Opt(wavinOptions ?? new WavinOptions()),
+            TestHelpers.Opt(new HeatingOptions { OnTemperature = 21, OffTemperature = 17, MaxCheckIntervalMinutes = 5 }),
+            new FakeTimeProvider(now ?? Now),
+            NullLogger<HeatingControlService>.Instance);
 
     [Fact]
     public async Task Sets_only_mismatched_rooms_in_one_request_per_device()
@@ -77,7 +74,7 @@ public class HeatingControlServiceTests
             Device("devices/1", Room(1, "Lounge", 17), Room(2, "Kitchen", 21), Room(3, "Hall", 21.04)),
             Device("devices/2", Room(1, "Bedroom", 19.5)));
 
-        await Create(wavin, OnTime).RunOnceAsync(CancellationToken.None);
+        await Create(wavin, On).RunOnceAsync(CancellationToken.None);
 
         Assert.Equal(2, wavin.Sent.Count);
         var (device1, sp1) = wavin.Sent[0];
@@ -92,7 +89,7 @@ public class HeatingControlServiceTests
     {
         var wavin = new FakeWavin(Device("devices/1", Room(1, "Lounge", 21), Room(2, "Kitchen", 17)));
 
-        await Create(wavin, OffTime).RunOnceAsync(CancellationToken.None);
+        await Create(wavin, Off).RunOnceAsync(CancellationToken.None);
 
         var (_, setpoints) = Assert.Single(wavin.Sent);
         var sp = Assert.Single(setpoints);
@@ -104,7 +101,7 @@ public class HeatingControlServiceTests
     public async Task Does_nothing_when_all_rooms_match()
     {
         var wavin = new FakeWavin(Device("devices/1", Room(1, "Lounge", 21), Room(2, "Kitchen", 21)));
-        await Create(wavin, OnTime).RunOnceAsync(CancellationToken.None);
+        await Create(wavin, On).RunOnceAsync(CancellationToken.None);
         Assert.Empty(wavin.Sent);
     }
 
@@ -114,7 +111,7 @@ public class HeatingControlServiceTests
         var wavin = new FakeWavin(Device("devices/1", Room(1, "Lounge", 17), Room(2, "Kitchen", 17), Room(3, "Hall", 17)));
         var options = new WavinOptions { Rooms = ["lounge", "3", "Nonexistent"] };
 
-        await Create(wavin, OnTime, options).RunOnceAsync(CancellationToken.None);
+        await Create(wavin, On, options).RunOnceAsync(CancellationToken.None);
 
         var (_, setpoints) = Assert.Single(wavin.Sent);
         Assert.Equal([1, 3], setpoints.Select(s => s.RoomId.GetInt32()).Order());
@@ -127,7 +124,7 @@ public class HeatingControlServiceTests
             Device("devices/1", Room(1, "Lounge", 17, "VACATION_MODE_ON"), Room(2, "Kitchen", 17)),
             UnmigratedDevice("devices/legacy"));
 
-        await Create(wavin, OnTime).RunOnceAsync(CancellationToken.None);
+        await Create(wavin, On).RunOnceAsync(CancellationToken.None);
 
         var (device, setpoints) = Assert.Single(wavin.Sent);
         Assert.Equal("devices/1", device);
@@ -139,7 +136,7 @@ public class HeatingControlServiceTests
     {
         var wavin = new FakeWavin(Device("devices/1", Room(1, "Lounge", 17)), Device("devices/2", Room(1, "Bedroom", 17)));
 
-        await Create(wavin, OnTime, new WavinOptions { DeviceName = "devices/2" }).RunOnceAsync(CancellationToken.None);
+        await Create(wavin, On, new WavinOptions { DeviceName = "devices/2" }).RunOnceAsync(CancellationToken.None);
 
         Assert.Equal("devices/2", Assert.Single(wavin.Sent).Device);
     }
@@ -148,7 +145,7 @@ public class HeatingControlServiceTests
     public async Task Uses_fallback_state_without_schedule()
     {
         var wavin = new FakeWavin(Device("devices/1", Room(1, "Lounge", 17)));
-        await Create(wavin, OffTime, withSchedule: false).RunOnceAsync(CancellationToken.None);
+        await Create(wavin, new DesiredState(HeatingState.On, IsFallback: true)).RunOnceAsync(CancellationToken.None);
         Assert.Equal(21, Assert.Single(Assert.Single(wavin.Sent).Setpoints).SetpointTemperature);
     }
 
@@ -158,7 +155,7 @@ public class HeatingControlServiceTests
     [InlineData("2026-11-02T10:29:59Z", 16)]
     public void NextDelay_wakes_after_slot_boundary_or_max_interval(string now, int expectedSeconds)
     {
-        var service = Create(new FakeWavin(), DateTimeOffset.Parse(now));
+        var service = Create(new FakeWavin(), On, now: DateTimeOffset.Parse(now));
         Assert.Equal(TimeSpan.FromSeconds(expectedSeconds), service.NextDelay(DateTimeOffset.Parse(now)));
     }
 }

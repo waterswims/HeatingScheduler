@@ -6,99 +6,189 @@ using Microsoft.Extensions.Time.Testing;
 
 namespace HeatingScheduler.Tests;
 
+public class SlotsTests
+{
+    [Theory]
+    [InlineData("2026-11-02T10:00:00Z", "2026-11-02T10:00:00Z")]
+    [InlineData("2026-11-02T10:29:59Z", "2026-11-02T10:00:00Z")]
+    [InlineData("2026-11-02T10:30:00Z", "2026-11-02T10:30:00Z")]
+    [InlineData("2026-07-02T10:45:00+01:00", "2026-07-02T09:30:00Z")]
+    public void StartFor_floors_to_half_hour(string instant, string expected)
+    {
+        Assert.Equal(DateTimeOffset.Parse(expected), Slots.StartFor(DateTimeOffset.Parse(instant)));
+    }
+}
+
 public class HeatingScheduleTests
 {
-    private static readonly AgileDay Day = new(new DateOnly(2026, 11, 2));
+    private static readonly DateTimeOffset T0 = DateTimeOffset.Parse("2026-11-04T12:00:00Z");
+
+    private static HeatingSchedule Create(
+        double ratio = 1.0, int minOnMinutes = 60, int startupOnMinutes = 60, HeatingState fallback = HeatingState.On) =>
+        new(TestHelpers.Opt(new ScheduleOptions
+            {
+                OffToOnRatio = ratio,
+                MinOnMinutes = minOnMinutes,
+                StartupAssumedOnMinutes = startupOnMinutes,
+                HorizonHours = 24,
+                FallbackState = fallback,
+            }),
+            NullLogger<HeatingSchedule>.Instance);
 
     [Theory]
     [InlineData(HeatingState.On)]
     [InlineData(HeatingState.Off)]
-    public void Returns_fallback_when_no_schedule(HeatingState fallback)
+    public void Uses_fallback_when_no_prices(HeatingState fallback)
     {
-        var schedule = new HeatingSchedule(TestHelpers.Opt(new ScheduleOptions { FallbackState = fallback }));
-        Assert.Equal(new DesiredState(fallback, IsFallback: true), schedule.GetDesiredState(Day.StartUtc));
+        var schedule = Create(fallback: fallback);
+        Assert.Equal(new DesiredState(fallback, IsFallback: true), schedule.GetDesiredState(T0));
     }
 
     [Fact]
-    public void Returns_on_only_during_selected_slots()
+    public void Startup_assumption_allows_staying_off_at_first()
     {
-        var schedule = new HeatingSchedule(TestHelpers.Opt(new ScheduleOptions()));
-        var slots = TestHelpers.SlotsFor(Day, i => i == 3 ? 1m : 50m);
-        schedule.SetDay(CheapestSlotSelector.Select(Day, slots, 100.0 / 48));
+        // Assumed 1h on with ratio 2 → may be off for up to 2h straight away.
+        var schedule = Create(ratio: 2.0, startupOnMinutes: 60);
+        schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 8, i => i < 4 ? 100m : 1m), T0);
 
-        var onSlot = slots[3].ValidFrom;
-        Assert.Equal(new DesiredState(HeatingState.On, false), schedule.GetDesiredState(onSlot));
-        Assert.Equal(new DesiredState(HeatingState.On, false), schedule.GetDesiredState(onSlot.AddMinutes(29)));
-        Assert.Equal(new DesiredState(HeatingState.Off, false), schedule.GetDesiredState(onSlot.AddMinutes(30)));
-        Assert.Equal(new DesiredState(HeatingState.Off, false), schedule.GetDesiredState(onSlot.AddMinutes(-1)));
+        Assert.Equal(new DesiredState(HeatingState.Off, false), schedule.GetDesiredState(T0));
     }
 
     [Fact]
-    public void RemoveDaysBefore_drops_finished_days()
+    public void Startup_assumption_of_zero_forces_heating_on()
     {
-        var schedule = new HeatingSchedule(TestHelpers.Opt(new ScheduleOptions()));
-        schedule.SetDay(CheapestSlotSelector.Select(Day, TestHelpers.SlotsFor(Day, i => i), 50));
-        schedule.RemoveDaysBefore(Day.EndUtc.AddTicks(-1));
-        Assert.True(schedule.HasDay(Day));
-        schedule.RemoveDaysBefore(Day.EndUtc);
-        Assert.False(schedule.HasDay(Day));
+        var schedule = Create(ratio: 2.0, startupOnMinutes: 0);
+        schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 8, i => i < 4 ? 100m : 1m), T0);
+
+        Assert.Equal(new DesiredState(HeatingState.On, false), schedule.GetDesiredState(T0));
+    }
+
+    [Fact]
+    public void Committed_slot_does_not_change_when_new_prices_arrive()
+    {
+        var schedule = Create(ratio: 1.0);
+        schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 8, i => i == 0 ? 1m : 50m), T0);
+        Assert.Equal(HeatingState.On, schedule.GetDesiredState(T0).State);
+
+        // New prices make the current slot expensive, but its decision is already committed.
+        schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 8, i => i == 0 ? 500m : 1m), T0.AddMinutes(10));
+        Assert.Equal(HeatingState.On, schedule.GetDesiredState(T0.AddMinutes(20)).State);
+    }
+
+    [Fact]
+    public void Follows_rules_across_slots_as_time_passes()
+    {
+        var random = new Random(7);
+        var prices = TestHelpers.SlotsFrom(T0, 48, _ => random.Next(5, 60));
+        var schedule = Create(ratio: 1.5, minOnMinutes: 60, startupOnMinutes: 60);
+        schedule.UpdatePrices(prices, T0);
+
+        var decisions = new List<bool>();
+        for (var i = 0; i < 40; i++)
+        {
+            decisions.Add(schedule.GetDesiredState(T0 + i * Slots.Length + TimeSpan.FromMinutes(1)).State == HeatingState.On);
+        }
+
+        Assert.True(RatioScheduleSolverTests.IsValid(decisions, HeatingHistory.On(2), 1.5, 2));
+    }
+
+    [Fact]
+    public void Exposes_plan_after_current_slot()
+    {
+        var schedule = Create();
+        schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 6, i => i), T0);
+        schedule.GetDesiredState(T0);
+
+        Assert.Equal(5, schedule.Plan.Count);
+        Assert.Equal(T0 + Slots.Length, schedule.Plan[0].Start);
+    }
+
+    [Fact]
+    public void PricesKnownUntil_stops_at_first_gap()
+    {
+        var schedule = Create();
+        var slots = TestHelpers.SlotsFrom(T0, 6, i => i);
+        slots.RemoveAt(4);
+        schedule.UpdatePrices(slots, T0);
+
+        Assert.Equal(T0 + 4 * Slots.Length, schedule.PricesKnownUntil(T0));
+    }
+
+    [Fact]
+    public void DescribeBlocks_groups_consecutive_states()
+    {
+        var plan = new List<PlannedSlot>
+        {
+            new(T0, HeatingState.On, 1),
+            new(T0 + Slots.Length, HeatingState.On, 1),
+            new(T0 + 2 * Slots.Length, HeatingState.Off, 1),
+        };
+        Assert.Equal("ON Wed 12:00–13:00, off Wed 13:00–13:30", HeatingSchedule.DescribeBlocks(plan));
     }
 }
 
-public class PriceSchedulerServiceTests
+public class PriceFetchServiceTests
 {
     private sealed class FakeOctopus(List<AgileSlot> available) : IOctopusAgileClient
     {
-        public int Calls { get; private set; }
+        public List<(DateTimeOffset From, DateTimeOffset To)> Calls { get; } = [];
 
         public Task<IReadOnlyList<AgileSlot>> GetRatesAsync(DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken cancellationToken)
         {
-            Calls++;
+            Calls.Add((fromUtc, toUtc));
             return Task.FromResult<IReadOnlyList<AgileSlot>>(
                 available.Where(s => s.ValidFrom >= fromUtc && s.ValidFrom < toUtc).ToList());
         }
     }
 
-    private static readonly AgileDay Today = new(new DateOnly(2026, 11, 2));
+    private static readonly DateTimeOffset Slot = DateTimeOffset.Parse("2026-11-04T12:00:00Z");
 
-    private static (PriceSchedulerService Service, HeatingSchedule Schedule) Create(FakeOctopus octopus, DateTimeOffset now)
+    private static (PriceFetchService Service, HeatingSchedule Schedule) Create(FakeOctopus octopus, DateTimeOffset now)
     {
-        var schedule = new HeatingSchedule(TestHelpers.Opt(new ScheduleOptions()));
-        var service = new PriceSchedulerService(
+        var scheduleOptions = TestHelpers.Opt(new ScheduleOptions { HorizonHours = 24 });
+        var schedule = new HeatingSchedule(scheduleOptions, NullLogger<HeatingSchedule>.Instance);
+        var service = new PriceFetchService(
             octopus, schedule,
-            TestHelpers.Opt(new OctopusOptions { ProductCode = "AGILE-24-10-01", RegionCode = "C" }),
-            TestHelpers.Opt(new ScheduleOptions { OnPercentage = 25 }),
+            TestHelpers.Opt(new OctopusOptions { ProductCode = "AGILE-24-10-01", RegionCode = "H" }),
+            scheduleOptions,
             new FakeTimeProvider(now),
-            NullLogger<PriceSchedulerService>.Instance);
+            NullLogger<PriceFetchService>.Instance);
         return (service, schedule);
     }
 
     [Fact]
-    public async Task Schedules_today_and_waits_for_tomorrow_until_complete()
+    public async Task Fetches_rolling_horizon_from_current_slot()
     {
-        var slots = TestHelpers.SlotsFor(Today, i => i);
-        slots.AddRange(TestHelpers.SlotsFor(Today.Next, i => i).Take(10)); // tomorrow only partially published
-        var octopus = new FakeOctopus(slots);
-        var (service, schedule) = Create(octopus, Today.StartUtc.AddHours(12));
+        var octopus = new FakeOctopus(TestHelpers.SlotsFrom(Slot, 20, i => i));
+        var (service, schedule) = Create(octopus, Slot.AddMinutes(10));
 
         await service.RunOnceAsync(CancellationToken.None);
 
-        Assert.True(schedule.HasDay(Today));
-        Assert.False(schedule.HasDay(Today.Next));
+        Assert.Equal((Slot, Slot.AddHours(24)), Assert.Single(octopus.Calls));
+        Assert.Equal(Slot + 20 * Slots.Length, schedule.PricesKnownUntil(Slot));
     }
 
     [Fact]
-    public async Task Does_not_refetch_once_both_days_are_scheduled()
+    public async Task Skips_fetch_when_whole_horizon_is_known()
     {
-        var slots = TestHelpers.SlotsFor(Today, i => i).Concat(TestHelpers.SlotsFor(Today.Next, i => i)).ToList();
-        var octopus = new FakeOctopus(slots);
-        var (service, schedule) = Create(octopus, Today.StartUtc.AddHours(18));
+        var octopus = new FakeOctopus(TestHelpers.SlotsFrom(Slot, 60, i => i));
+        var (service, _) = Create(octopus, Slot);
 
         await service.RunOnceAsync(CancellationToken.None);
         await service.RunOnceAsync(CancellationToken.None);
 
-        Assert.True(schedule.HasDay(Today));
-        Assert.True(schedule.HasDay(Today.Next));
-        Assert.Equal(1, octopus.Calls);
+        Assert.Single(octopus.Calls);
+    }
+
+    [Fact]
+    public async Task Fetches_again_while_horizon_is_incomplete()
+    {
+        var octopus = new FakeOctopus(TestHelpers.SlotsFrom(Slot, 20, i => i));
+        var (service, _) = Create(octopus, Slot);
+
+        await service.RunOnceAsync(CancellationToken.None);
+        await service.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(2, octopus.Calls.Count);
     }
 }

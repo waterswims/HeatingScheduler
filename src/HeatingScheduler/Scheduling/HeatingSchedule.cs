@@ -1,3 +1,5 @@
+using System.Text;
+using HeatingScheduler.Octopus;
 using HeatingScheduler.Options;
 using Microsoft.Extensions.Options;
 
@@ -5,14 +7,105 @@ namespace HeatingScheduler.Scheduling;
 
 public sealed record DesiredState(HeatingState State, bool IsFallback);
 
-/// <summary>Thread-safe in-memory store of computed day schedules, shared by both background services.</summary>
-public sealed class HeatingSchedule(IOptions<ScheduleOptions> options)
+public sealed record PlannedSlot(DateTimeOffset Start, HeatingState State, decimal Price);
+
+public interface IHeatingSchedule
 {
+    /// <summary>The state for the slot containing <paramref name="utcNow"/>. Fixed once decided.</summary>
+    DesiredState GetDesiredState(DateTimeOffset utcNow);
+
+    void MarkFirstAttemptComplete();
+
+    Task WaitForFirstAttemptAsync(TimeSpan timeout, TimeProvider timeProvider, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Thread-safe store of known prices and committed slot decisions, shared by both background services.
+/// <para>
+/// Works as a rolling-horizon planner: when a slot starts, the solver plans the next <see cref="ScheduleOptions.HorizonHours"/>
+/// (or as far as prices are known) from the actual history, and the first slot of that plan is committed.
+/// Committed slots never change; the rest of the plan is recomputed as time passes and new prices arrive.
+/// </para>
+/// </summary>
+public sealed class HeatingSchedule : IHeatingSchedule
+{
+    private static readonly TimeSpan MaxCatchUp = TimeSpan.FromHours(24);
+
+    private readonly ScheduleOptions _options;
+    private readonly RatioRules _rules;
+    private readonly ILogger<HeatingSchedule> _logger;
     private readonly Lock _lock = new();
-    private readonly Dictionary<AgileDay, DaySchedule> _days = [];
+    private readonly SortedDictionary<DateTimeOffset, decimal> _prices = [];
+    private readonly Dictionary<DateTimeOffset, DesiredState> _committed = [];
     private readonly TaskCompletionSource _firstAttempt = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>Signals that the first price fetch has been attempted (whether or not it succeeded).</summary>
+    private DateTimeOffset? _nextSlot;          // first slot without a committed decision
+    private HeatingHistory _history;            // history at the start of _nextSlot
+    private IReadOnlyList<PlannedSlot> _plan = []; // current plan from _nextSlot onwards
+    private IReadOnlyList<PlannedSlot> _lastLoggedPlan = [];
+
+    public HeatingSchedule(IOptions<ScheduleOptions> options, ILogger<HeatingSchedule> logger)
+    {
+        _options = options.Value;
+        _rules = new RatioRules(_options.OffToOnRatio, Slots.FromMinutes(_options.MinOnMinutes));
+        _logger = logger;
+    }
+
+    public HeatingHistory StartupHistory => _options.StartupAssumedOnMinutes > 0
+        ? HeatingHistory.On(Slots.FromMinutes(_options.StartupAssumedOnMinutes))
+        : HeatingHistory.Off(0, 0);
+
+    /// <summary>The plan for slots after the current one (for logging and tests).</summary>
+    public IReadOnlyList<PlannedSlot> Plan
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _plan;
+            }
+        }
+    }
+
+    /// <summary>End of the unbroken run of known prices starting at <paramref name="fromSlot"/>.</summary>
+    public DateTimeOffset PricesKnownUntil(DateTimeOffset fromSlot)
+    {
+        lock (_lock)
+        {
+            var t = fromSlot;
+            while (_prices.ContainsKey(t))
+            {
+                t += Slots.Length;
+            }
+
+            return t;
+        }
+    }
+
+    public void UpdatePrices(IEnumerable<AgileSlot> slots, DateTimeOffset utcNow)
+    {
+        lock (_lock)
+        {
+            foreach (var slot in slots)
+            {
+                _prices[slot.ValidFrom] = slot.PriceIncVat;
+            }
+
+            CommitUpTo(utcNow);
+            _plan = PlanFrom(_nextSlot!.Value);
+            LogPlanIfChanged();
+        }
+    }
+
+    public DesiredState GetDesiredState(DateTimeOffset utcNow)
+    {
+        lock (_lock)
+        {
+            CommitUpTo(utcNow);
+            return _committed[Slots.StartFor(utcNow)];
+        }
+    }
+
     public void MarkFirstAttemptComplete() => _firstAttempt.TrySetResult();
 
     /// <summary>Waits for the first price fetch attempt, up to <paramref name="timeout"/>, so the controller doesn't act on the fallback state at startup.</summary>
@@ -28,49 +121,131 @@ public sealed class HeatingSchedule(IOptions<ScheduleOptions> options)
         }
     }
 
-    public bool HasDay(AgileDay day)
+    /// <summary>Commits decisions for every slot up to and including the one containing <paramref name="utcNow"/>.</summary>
+    private void CommitUpTo(DateTimeOffset utcNow)
     {
-        lock (_lock)
+        var current = Slots.StartFor(utcNow);
+        if (_nextSlot is null || _nextSlot < current - MaxCatchUp)
         {
-            return _days.ContainsKey(day);
-        }
-    }
-
-    public void SetDay(DaySchedule schedule)
-    {
-        lock (_lock)
-        {
-            _days[schedule.Day] = schedule;
-        }
-    }
-
-    /// <summary>Removes schedules for days that ended before <paramref name="utcNow"/>.</summary>
-    public void RemoveDaysBefore(DateTimeOffset utcNow)
-    {
-        lock (_lock)
-        {
-            foreach (var day in _days.Keys.Where(d => d.EndUtc <= utcNow).ToList())
+            if (_nextSlot is not null)
             {
-                _days.Remove(day);
+                _logger.LogWarning("No decisions made since {Slot}; restarting from the startup assumption", Slots.Uk(_nextSlot.Value));
             }
+
+            _nextSlot = current;
+            _history = StartupHistory;
+            _logger.LogInformation("Starting schedule at {Slot} assuming the heating was {History}", Slots.Uk(current), _history);
+        }
+
+        var committedAny = false;
+        while (_nextSlot <= current)
+        {
+            var slot = _nextSlot.Value;
+            var plan = PlanFrom(slot);
+            DesiredState decision;
+            if (plan.Count == 0)
+            {
+                decision = new DesiredState(_options.FallbackState, IsFallback: true);
+                if (decision.State == HeatingState.Off && !_rules.CanBeOff(_history))
+                {
+                    _logger.LogWarning("Fallback state Off at {Slot} breaks the off:on ratio ({History})", Slots.Uk(slot), _history);
+                }
+            }
+            else
+            {
+                decision = new DesiredState(plan[0].State, IsFallback: false);
+            }
+
+            _committed[slot] = decision;
+            _history = _history.Advance(decision.State == HeatingState.On);
+            _nextSlot = slot + Slots.Length;
+            _plan = plan.Count > 0 ? plan.Skip(1).ToList() : [];
+            committedAny = true;
+            _logger.LogDebug("Committed {Slot}: {State}{Fallback}; now {History}",
+                Slots.Uk(slot), decision.State, decision.IsFallback ? " (fallback)" : "", _history);
+        }
+
+        if (committedAny)
+        {
+            foreach (var old in _committed.Keys.Where(k => k < current - MaxCatchUp).ToList())
+            {
+                _committed.Remove(old);
+            }
+
+            foreach (var old in _prices.Keys.TakeWhile(k => k < current).ToList())
+            {
+                _prices.Remove(old);
+            }
+
+            LogPlanIfChanged();
         }
     }
 
-    public DesiredState GetDesiredState(DateTimeOffset utcNow)
+    /// <summary>Solves the schedule from <paramref name="from"/> over the known prices within the horizon, starting from the current history.</summary>
+    private List<PlannedSlot> PlanFrom(DateTimeOffset from)
     {
-        var day = AgileDay.Containing(utcNow);
-        DaySchedule? schedule;
-        lock (_lock)
+        var end = from + TimeSpan.FromHours(_options.HorizonHours);
+        var starts = new List<DateTimeOffset>();
+        var prices = new List<decimal>();
+        for (var t = from; t < end && _prices.TryGetValue(t, out var price); t += Slots.Length)
         {
-            _days.TryGetValue(day, out schedule);
+            starts.Add(t);
+            prices.Add(price);
         }
 
-        if (schedule is null)
+        var result = RatioScheduleSolver.Solve(prices, _history, _rules);
+        return starts
+            .Select((s, i) => new PlannedSlot(s, result.On[i] ? HeatingState.On : HeatingState.Off, prices[i]))
+            .ToList();
+    }
+
+    /// <summary>Logs the plan when it differs from the last logged one (ignoring slots that have since passed).</summary>
+    private void LogPlanIfChanged()
+    {
+        var previous = _lastLoggedPlan.ToDictionary(p => p.Start, p => p.State);
+        var unchanged = _plan.Count > 0
+            && _plan.All(p => previous.TryGetValue(p.Start, out var s) && s == p.State);
+        if (unchanged || _plan.Count == 0)
         {
-            return new DesiredState(options.Value.FallbackState, IsFallback: true);
+            return;
         }
 
-        var state = schedule.IsOn(AgileDay.SlotStartFor(utcNow)) ? HeatingState.On : HeatingState.Off;
-        return new DesiredState(state, IsFallback: false);
+        _lastLoggedPlan = _plan;
+        var on = _plan.Where(p => p.State == HeatingState.On).ToList();
+        _logger.LogInformation(
+            "Plan to {End} (UK): {Blocks}. On {OnHours:0.#}h of {TotalHours:0.#}h, avg on price {OnPrice:F2}p vs {AvgPrice:F2}p/kWh",
+            Slots.Uk(_plan[^1].Start + Slots.Length),
+            DescribeBlocks(_plan),
+            on.Count / 2.0,
+            _plan.Count / 2.0,
+            on.Count > 0 ? on.Average(p => p.Price) : 0m,
+            _plan.Average(p => p.Price));
+    }
+
+    public static string DescribeBlocks(IReadOnlyList<PlannedSlot> plan)
+    {
+        var sb = new StringBuilder();
+        var i = 0;
+        while (i < plan.Count)
+        {
+            var j = i;
+            while (j + 1 < plan.Count && plan[j + 1].State == plan[i].State)
+            {
+                j++;
+            }
+
+            if (sb.Length > 0)
+            {
+                sb.Append(", ");
+            }
+
+            sb.Append(plan[i].State == HeatingState.On ? "ON " : "off ")
+                .Append(Slots.Uk(plan[i].Start))
+                .Append('–')
+                .Append(Slots.Uk(plan[j].Start + Slots.Length, "HH:mm"));
+            i = j + 1;
+        }
+
+        return sb.ToString();
     }
 }

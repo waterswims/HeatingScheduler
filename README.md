@@ -1,15 +1,22 @@
 # HeatingScheduler
 
-A .NET 10 worker service that runs underfloor heating in the cheapest [Octopus Agile](https://octopus.energy/smart/agile/) half-hour slots by setting room setpoints on a **Wavin Sentio** system.
+A .NET 10 worker service that runs underfloor heating at the lowest [Octopus Agile](https://octopus.energy/smart/agile/) cost, within an off:on ratio, by setting room setpoints on a **Wavin Sentio** system.
 
 It runs two background services in one process:
 
 | Service | What it does |
 |---|---|
-| `PriceSchedulerService` | Every `FetchIntervalMinutes` it fetches Agile prices. When every slot of an Agile day (23:00 → 23:00 UK time) is priced, it picks the cheapest `OnPercentage`% of that day's half-hour slots to be **on**. A schedule is fixed once worked out. Tomorrow's is normally ready shortly after Octopus publishes prices at about 16:00. |
+| `PriceFetchService` | Every `FetchIntervalMinutes` it fetches Agile prices for the next `HorizonHours` (rolling), until prices are known for that whole period. Octopus publishes the next day's prices at about 16:00, so before then the horizon is shorter. |
 | `HeatingControlService` | Just after every half-hour boundary, and at least every `MaxCheckIntervalMinutes`, it reads each room's setpoint from the Wavin Sentio cloud. Any room that doesn't match `OnTemperature` or `OffTemperature` for the current slot is set. |
 
-The two services share the schedule in memory. After a restart the current day is rebuilt from the Octopus API, which also returns past prices.
+The two services share the schedule in memory.
+
+### How the on/off schedule is chosen
+
+- **The rule:** after the heating has been on for a block of time *L*, it may then be off for at most `OffToOnRatio` × *L*. It may be off for less. On-blocks last at least `MinOnMinutes`. For example, with a ratio of 2, one hour on allows up to two hours off.
+- **The solver:** finds the on/off pattern over the next `HorizonHours` (or as far as prices are known) with the **lowest total price** that obeys the rule. It uses dynamic programming over the half-hour slots, so the result is exactly optimal, not an approximation. With positive prices this means as little on-time as the ratio allows, placed in the cheapest slots. When prices are negative, the heating comes on.
+- **Rolling horizon:** when each half-hour slot starts, the solver re-plans from what actually happened so far. That slot's decision is then fixed. The rest of the plan is re-optimised as time passes and new prices arrive, and the log shows the plan whenever it changes.
+- **After a restart:** the history is lost, so the solver assumes the heating has just finished a `StartupAssumedOnMinutes` on-block.
 
 > **Notes**
 > - The Wavin Sentio cloud API is **unofficial**. It is ported from the community library [djerik/wavinsentio](https://github.com/djerik/wavinsentio). Wavin could change it without notice.
@@ -22,8 +29,11 @@ The two services share the schedule in memory. After a restart the current day i
 | `Octopus:ProductCode` | `AGILE-24-10-01` | Your Agile product. Check your Octopus account or `https://api.octopus.energy/v1/products/?brand=OCTOPUS_ENERGY`. |
 | `Octopus:RegionCode` | `C` | Region letter A–P: the last letter of your tariff code (`E-1R-AGILE-24-10-01-C`). |
 | `Octopus:FetchIntervalMinutes` | `30` | How often prices are checked. |
-| `Schedule:OnPercentage` | `40` | Percentage of each Agile day's slots that are on (rounded to the nearest slot, e.g. 40% → 19 of 48). |
-| `Schedule:FallbackState` | `On` | State used when no schedule exists for the current slot, e.g. if the Octopus API is down. |
+| `Schedule:OffToOnRatio` | `1.0` | Maximum off time as a multiple of the preceding on-block. The allowance is rounded down to whole slots, e.g. 1.5 × 30 min allows 30 min. |
+| `Schedule:MinOnMinutes` | `60` | Shortest on-block (a multiple of 30). Use `30` for no minimum. |
+| `Schedule:StartupAssumedOnMinutes` | `60` | After a restart, assume an on-block this long has just ended (a multiple of 30). `0` forces the heating on straight away. |
+| `Schedule:HorizonHours` | `24` | How far ahead the solver plans (rolling). |
+| `Schedule:FallbackState` | `On` | State used when there's no price for the current slot, e.g. if the Octopus API is down. |
 | `Wavin:Email` / `Wavin:Password` | — | Wavin Sentio app login. **Secret, so don't put it in appsettings.json.** |
 | `Wavin:DeviceName` | `null` | Limit control to one controller (e.g. `devices/xxxx`). When empty, every device on the account is used. |
 | `Wavin:Rooms` | `[]` | Room ids or names to control. When empty, every room is controlled. Unknown names are logged together with the list of available rooms. |

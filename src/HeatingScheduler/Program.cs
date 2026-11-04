@@ -15,6 +15,7 @@ builder.Services.AddOptions<HeatingOptions>().BindConfiguration(HeatingOptions.S
 
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<HeatingSchedule>();
+builder.Services.AddSingleton<IHeatingSchedule>(sp => sp.GetRequiredService<HeatingSchedule>());
 
 // Octopus Agile prices (public API, no auth).
 builder.Services
@@ -31,7 +32,7 @@ var wavinHttp = builder.Services.AddHttpClient<IWavinClient, WavinClient>((sp, c
 wavinHttp.AddStandardResilienceHandler();          // outer: retries/timeouts
 wavinHttp.AddHttpMessageHandler<WavinAuthHandler>(); // inner: fresh token on every attempt
 
-builder.Services.AddHostedService<PriceSchedulerService>();
+builder.Services.AddHostedService<PriceFetchService>();
 builder.Services.AddHostedService<HeatingControlService>();
 
 builder.Build().Run();
