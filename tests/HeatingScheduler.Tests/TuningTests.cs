@@ -176,15 +176,15 @@ public class ThermalEstimatorTests
     public void Max_off_is_rounded_down_to_whole_slots_and_clamped()
     {
         // 2°C / 0.7°C/h = 171 min → 150.
-        var room = new SeriesBuilder("A").Phase(HeatingState.Off, 240, -0.7).Build();
+        var room = new SeriesBuilder("A").Phase(HeatingState.Off, 240, -0.7).Phase(HeatingState.On, 30, 1.0).Build();
         Assert.Equal(150, ThermalEstimator.Estimate([room], Settings).MaxOffMinutes);
 
         // Very fast cooling → below the lower bound → 60.
-        var cold = new SeriesBuilder("B").Phase(HeatingState.Off, 120, -3.0).Build();
+        var cold = new SeriesBuilder("B").Phase(HeatingState.Off, 120, -3.0).Phase(HeatingState.On, 30, 1.0).Build();
         Assert.Equal(60, ThermalEstimator.Estimate([cold], Settings).MaxOffMinutes);
 
         // Warming while off (sun) → no measurable cooling → upper bound.
-        var sunny = new SeriesBuilder("C").Phase(HeatingState.Off, 120, 0.3).Build();
+        var sunny = new SeriesBuilder("C").Phase(HeatingState.Off, 120, 0.3).Phase(HeatingState.On, 30, 1.0).Build();
         var result = ThermalEstimator.Estimate([sunny], Settings);
         Assert.Equal(720, result.MaxOffMinutes);
         Assert.Null(result.OnToOffRatio);
@@ -193,8 +193,35 @@ public class ThermalEstimatorTests
     [Fact]
     public void Off_period_starting_below_minimum_gives_lower_bound()
     {
-        var room = new SeriesBuilder("A").StartAt(20.5).Phase(HeatingState.Off, 120, -0.5).Build();
+        var room = new SeriesBuilder("A").StartAt(20.5).Phase(HeatingState.Off, 120, -0.5).Phase(HeatingState.On, 30, 1.0).Build();
         Assert.Equal(60, ThermalEstimator.Estimate([room], Settings).MaxOffMinutes);
+    }
+
+    [Fact]
+    public void Ignores_off_period_still_in_progress()
+    {
+        // The current off period has run longest, but its early part shows heat still coming out of the floor,
+        // so cooling is measured from the finished one (0.5°C/h → 4h max off) instead.
+        var room = new SeriesBuilder("Lounge")
+            .Phase(HeatingState.Off, 240, -0.5)
+            .Phase(HeatingState.On, 120, 2.0, cap: 23.0)
+            .Phase(HeatingState.Off, 300, -0.05)   // in progress, longer, slow at first
+            .Build();
+
+        var estimate = Assert.Single(ThermalEstimator.Estimate([room], Settings).Rooms);
+
+        Assert.Equal(TimeSpan.FromMinutes(240), estimate.OffDuration);
+        Assert.Equal(0.5, estimate.CoolingPerHour!.Value, 2);
+    }
+
+    [Fact]
+    public void No_finished_off_period_gives_nothing()
+    {
+        var room = new SeriesBuilder("A").Phase(HeatingState.On, 60, 1.0).Phase(HeatingState.Off, 240, -0.5).Build();
+        var result = ThermalEstimator.Estimate([room], Settings);
+
+        Assert.Null(result.MaxOffMinutes);
+        Assert.Contains("no finished off period", Assert.Single(result.Rooms).Note);
     }
 
     [Fact]
@@ -238,7 +265,8 @@ public class ThermalEstimatorTests
     public void On_period_after_or_before_a_gap_is_not_used_for_heating()
     {
         var afterGap = new SeriesBuilder("A")
-            .Phase(HeatingState.Off, 240, -0.5).Gap(60).Phase(HeatingState.On, 90, 2.0).Phase(HeatingState.Off, 30, -0.5).Build();
+            .Phase(HeatingState.Off, 240, -0.5).Phase(HeatingState.On, 30, 1.0)
+            .Gap(60).Phase(HeatingState.On, 90, 2.0).Phase(HeatingState.Off, 30, -0.5).Build();
         var beforeGap = new SeriesBuilder("B")
             .Phase(HeatingState.Off, 240, -0.5).Phase(HeatingState.On, 90, 2.0).Gap(60).Phase(HeatingState.Off, 30, -0.5).Build();
 

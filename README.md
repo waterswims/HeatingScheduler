@@ -28,7 +28,7 @@ The make-up ratio and maximum off period can be worked out from your rooms inste
 
 - **Readings:** the Sentio keeps months of room history (air and floor temperature, humidity and setpoint). The app reads the last 24 hours for each room it tunes against, at 5-minute resolution, using the same unofficial API call as the Wavin Sentio portal (`GetSentioRoomTimeSeries`). A reading counts as on or off when its setpoint is the on or off temperature; readings with any other setpoint (for example, set by hand) are left out. Nothing needs to be learnt after a restart.
 - **Recalculation:** at startup, then every 30 minutes, for each room:
-  - **Cooling rate:** the temperature drop per hour over the **longest off period** in the last 24 hours, fitted across all of its readings. Off periods shorter than an hour are ignored.
+  - **Cooling rate:** the temperature drop per hour over the **longest finished** off period in the last 24 hours, fitted across all of its readings. Off periods shorter than an hour are ignored, and so is one still in progress, because its early part mostly shows heat still coming out of the floor.
   - **Maximum off** = (temperature when that off period started − `Tuning:MinTemperature`) ÷ cooling rate.
   - **Heating rate:** the median temperature rise per hour across every **finished** on period in the last 24 hours that directly followed an off period. Each one is measured from switch-on until the room reached the on temperature, or until the on period ended if it never got there, and needs at least an hour of readings. On periods still in progress aren't used, because their early part mostly shows the floor's lag.
   - **Make-up ratio** = cooling rate ÷ heating rate.

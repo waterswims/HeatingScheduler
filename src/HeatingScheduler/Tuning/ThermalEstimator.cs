@@ -29,8 +29,9 @@ public sealed record TuningResult(double? OnToOffRatio, int? MaxOffMinutes, IRea
 /// <summary>
 /// Works out the maximum off period and the make-up ratio from recorded room temperatures.
 /// <list type="number">
-/// <item><b>Cooling:</b> the longest off period in the history; the cooling rate is the fitted (least-squares)
-/// temperature drop per minute over that period.</item>
+/// <item><b>Cooling:</b> the longest finished off period in the history; the cooling rate is the fitted
+/// (least-squares) temperature drop per minute over that period. Off periods still in progress are not used: their
+/// early part mostly shows heat still coming out of the floor, which would understate cooling.</item>
 /// <item><b>Max off:</b> (temperature when that off period started − minimum temperature) ÷ cooling rate.</item>
 /// <item><b>Heating:</b> every finished on period that directly follows an off period, from switch-on until the room
 /// reached the on temperature (or the on period ended, if it never did). Each gives a fitted rise per minute, if it has
@@ -93,14 +94,16 @@ public static class ThermalEstimator
     {
         var segments = Split(room.Readings);
 
+        // Finished: directly followed by another period (so not still running, and not cut off by a gap).
         var longestOff = segments
-            .Where(s => s.State == HeatingState.Off && s.Duration >= MinOffPeriod && s.Readings.Count >= 2)
+            .Where((s, i) => s.State == HeatingState.Off && s.Duration >= MinOffPeriod && s.Readings.Count >= 2
+                && i + 1 < segments.Count && segments[i + 1].FollowsPrevious)
             .MaxBy(s => s.Duration);
 
         if (longestOff is null)
         {
             return new RoomEstimate(room.Name, null, null, null, null, 0, null, null,
-                $"no off period of {MinOffPeriod.TotalMinutes:0} min or more yet");
+                $"no finished off period of {MinOffPeriod.TotalMinutes:0} min or more yet");
         }
 
         var coolingPerMinute = -SlopePerMinute(longestOff.Readings);
