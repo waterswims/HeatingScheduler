@@ -20,7 +20,7 @@ The two services share the schedule in memory.
   - For example, with a ratio of 0.5 and a 3-hour maximum, 2 hours off must be followed by at least 1 hour on.
 - **The solver:** finds the on/off pattern over the next `HorizonHours` (or as far as prices are known) with the **lowest total price** that obeys the rule. It uses dynamic programming over the half-hour slots, so the result is exactly optimal, not an approximation. With positive prices it keeps the heating off through expensive periods and does the make-up heating in the cheapest slots. When prices are negative, the heating comes on.
 - **Rolling horizon:** when each half-hour slot starts, the solver re-plans from what actually happened so far. That slot's decision is then fixed. The rest of the plan is re-optimised as time passes and new prices arrive, and the log shows the plan whenever it changes.
-- **After a restart:** the history is lost, so the solver assumes the heating has been on for `StartupAssumedOnMinutes` with no heat left to make up.
+- **After a restart:** the history is lost, so the solver assumes the heating has been on with no heat left to make up. It is free to switch off straight away, even if the heating had already been off for a while before the restart.
 
 > **Notes**
 > - The Wavin Sentio cloud API is **unofficial**. It is ported from the community library [djerik/wavinsentio](https://github.com/djerik/wavinsentio). Wavin could change it without notice.
@@ -36,7 +36,6 @@ The two services share the schedule in memory.
 | `Schedule:OnToOffRatio` | `0.25` | Minimum on-time after an off period, as a multiple of that off period (rounded up to whole slots). For example, 0.25 means 2 h off requires at least 30 min on. |
 | `Schedule:MaxOffMinutes` | `180` | Longest allowed off period (a multiple of 30). |
 | `Schedule:MinOnMinutes` | `60` | Shortest on-block (a multiple of 30). Use `30` for no minimum beyond the make-up time. |
-| `Schedule:StartupAssumedOnMinutes` | `60` | After a restart, assume the heating has been on this long with nothing to make up (a multiple of 30). If this is below `MinOnMinutes`, the heating stays on until the minimum is reached. |
 | `Schedule:HorizonHours` | `24` | How far ahead the solver plans (rolling). |
 | `Schedule:FallbackState` | `On` | State used when there's no price for the current slot, e.g. if the Octopus API is down. |
 | `Wavin:Email` / `Wavin:Password` | — | Wavin Sentio app login. **Secret, so don't put it in appsettings.json.** |

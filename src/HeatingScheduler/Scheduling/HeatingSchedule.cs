@@ -54,7 +54,11 @@ public sealed class HeatingSchedule : IHeatingSchedule
         _logger = logger;
     }
 
-    public HeatingHistory StartupHistory => HeatingHistory.On(Slots.FromMinutes(_options.StartupAssumedOnMinutes));
+    /// <summary>
+    /// History assumed after a restart, when the real history is unknown: the heating has been on for the
+    /// minimum on-block with no heat left to make up, so the solver is free to switch off straight away.
+    /// </summary>
+    public HeatingHistory StartupHistory => HeatingHistory.On(_rules.MinOnSlots);
 
     /// <summary>The plan for slots after the current one (for logging and tests).</summary>
     public IReadOnlyList<PlannedSlot> Plan

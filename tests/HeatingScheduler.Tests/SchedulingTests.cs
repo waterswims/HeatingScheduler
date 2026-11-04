@@ -24,13 +24,12 @@ public class HeatingScheduleTests
     private static readonly DateTimeOffset T0 = DateTimeOffset.Parse("2026-11-04T12:00:00Z");
 
     private static HeatingSchedule Create(
-        double ratio = 0.5, int maxOffMinutes = 180, int minOnMinutes = 60, int startupOnMinutes = 60, HeatingState fallback = HeatingState.On) =>
+        double ratio = 0.5, int maxOffMinutes = 180, int minOnMinutes = 60, HeatingState fallback = HeatingState.On) =>
         new(TestHelpers.Opt(new ScheduleOptions
             {
                 OnToOffRatio = ratio,
                 MaxOffMinutes = maxOffMinutes,
                 MinOnMinutes = minOnMinutes,
-                StartupAssumedOnMinutes = startupOnMinutes,
                 HorizonHours = 24,
                 FallbackState = fallback,
             }),
@@ -48,27 +47,17 @@ public class HeatingScheduleTests
     [Fact]
     public void Startup_assumption_allows_staying_off_at_first()
     {
-        // Assumed 1h on (meeting the 1h minimum) with nothing to make up → may switch off straight away.
-        var schedule = Create(startupOnMinutes: 60);
+        // Assumed on for the minimum with nothing to make up → may switch off straight away.
+        var schedule = Create();
         schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 8, i => i < 4 ? 100m : 1m), T0);
 
         Assert.Equal(new DesiredState(HeatingState.Off, false), schedule.GetDesiredState(T0));
     }
 
     [Fact]
-    public void Startup_assumption_of_zero_forces_heating_on()
-    {
-        // Assumed 0 min on with a 1h minimum → must be on first.
-        var schedule = Create(startupOnMinutes: 0);
-        schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 8, i => i < 4 ? 100m : 1m), T0);
-
-        Assert.Equal(new DesiredState(HeatingState.On, false), schedule.GetDesiredState(T0));
-    }
-
-    [Fact]
     public void Committed_slot_does_not_change_when_new_prices_arrive()
     {
-        var schedule = Create(startupOnMinutes: 30);
+        var schedule = Create();
         schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 8, i => i == 0 ? 1m : 50m), T0);
         Assert.Equal(HeatingState.On, schedule.GetDesiredState(T0).State);
 
@@ -82,7 +71,7 @@ public class HeatingScheduleTests
     {
         var random = new Random(7);
         var prices = TestHelpers.SlotsFrom(T0, 48, _ => random.Next(5, 60));
-        var schedule = Create(ratio: 0.75, maxOffMinutes: 120, minOnMinutes: 60, startupOnMinutes: 60);
+        var schedule = Create(ratio: 0.75, maxOffMinutes: 120, minOnMinutes: 60);
         schedule.UpdatePrices(prices, T0);
 
         var decisions = new List<bool>();
