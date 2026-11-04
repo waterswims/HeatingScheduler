@@ -1,38 +1,45 @@
 namespace HeatingScheduler.Scheduling;
 
 /// <summary>
-/// The heating's recent history immediately before a slot: either on for <see cref="OnSlots"/> slots,
-/// or off for <see cref="OffSlots"/> slots after an on-block of <see cref="OnSlots"/> slots.
+/// The heating's recent history immediately before a slot.
+/// <list type="bullet">
+/// <item>On: on for <see cref="OnSlots"/> slots, following an off period of <see cref="OffSlots"/> slots.</item>
+/// <item>Off: off for <see cref="OffSlots"/> slots (<see cref="OnSlots"/> is 0).</item>
+/// </list>
 /// </summary>
 public readonly record struct HeatingHistory(bool IsOn, int OnSlots, int OffSlots)
 {
-    public static HeatingHistory On(int onSlots) => new(true, onSlots, 0);
+    public static HeatingHistory On(int onSlots, int afterOffSlots = 0) => new(true, onSlots, afterOffSlots);
 
-    public static HeatingHistory Off(int lastOnSlots, int offSlots) => new(false, lastOnSlots, offSlots);
+    public static HeatingHistory Off(int offSlots) => new(false, 0, offSlots);
 
     public HeatingHistory Advance(bool on) => on
-        ? (IsOn ? this with { OnSlots = OnSlots + 1 } : On(1))
-        : (IsOn ? Off(OnSlots, 1) : this with { OffSlots = OffSlots + 1 });
+        ? (IsOn ? this with { OnSlots = OnSlots + 1 } : On(1, OffSlots))
+        : (IsOn ? Off(1) : this with { OffSlots = OffSlots + 1 });
 
     public override string ToString() => IsOn
-        ? $"on for {OnSlots * 30} min"
-        : $"off for {OffSlots * 30} min after {OnSlots * 30} min on";
+        ? $"on for {OnSlots * 30} min after {OffSlots * 30} min off"
+        : $"off for {OffSlots * 30} min";
 }
 
 /// <summary>
-/// The scheduling rules: an on-block must last at least <see cref="MinOnSlots"/> slots, and may be followed
-/// by at most ⌊<see cref="OffToOnRatio"/> × its length⌋ off slots.
+/// The scheduling rules:
+/// <list type="bullet">
+/// <item>an off period lasts at most <see cref="MaxOffSlots"/> slots;</item>
+/// <item>the on-block after an off period of F slots must last at least ⌈<see cref="OnToOffRatio"/> × F⌉ slots,
+/// to make up the heat lost, and never less than <see cref="MinOnSlots"/>.</item>
+/// </list>
 /// </summary>
-public sealed record RatioRules(double OffToOnRatio, int MinOnSlots)
+public sealed record RatioRules(double OnToOffRatio, int MinOnSlots, int MaxOffSlots)
 {
-    /// <summary>Maximum number of off slots allowed after an on-block of <paramref name="onSlots"/> slots.</summary>
-    public int MaxOffSlotsAfter(int onSlots) =>
-        onSlots < MinOnSlots ? 0 : (int)Math.Floor(OffToOnRatio * onSlots + 1e-9);
+    /// <summary>Minimum length of the on-block that follows an off period of <paramref name="offSlots"/> slots.</summary>
+    public int RequiredOnSlotsAfter(int offSlots) =>
+        Math.Max(MinOnSlots, (int)Math.Ceiling(OnToOffRatio * offSlots - 1e-9));
 
     /// <summary>Whether the next slot may be off, given <paramref name="history"/>.</summary>
     public bool CanBeOff(HeatingHistory history) => history.IsOn
-        ? MaxOffSlotsAfter(history.OnSlots) >= 1
-        : history.OffSlots < MaxOffSlotsAfter(history.OnSlots);
+        ? history.OnSlots >= RequiredOnSlotsAfter(history.OffSlots) && MaxOffSlots >= 1
+        : history.OffSlots < MaxOffSlots;
 }
 
 public sealed record SolveResult(IReadOnlyList<bool> On, decimal Cost);
@@ -40,11 +47,12 @@ public sealed record SolveResult(IReadOnlyList<bool> On, decimal Cost);
 /// <summary>
 /// Finds the on/off sequence with the lowest total price (sum of the prices of "on" slots) that obeys
 /// <see cref="RatioRules"/>, using dynamic programming over the half-hour slots. The result is exactly optimal.
-/// Ties are broken by fewest on/off switches.
+/// Ties are broken by fewest on/off switches. An on-block still owing make-up time when the horizon ends is
+/// allowed; the rolling re-plan deals with it once more prices are known.
 /// </summary>
 public static class RatioScheduleSolver
 {
-    // DP state. On-phase: N = length of the current on-block (capped). Off-phase: N = off slots still allowed (capped).
+    // DP state. On-phase: N = on slots still required before switching off. Off-phase: N = off slots so far.
     private readonly record struct State(bool IsOn, int N);
 
     private readonly record struct Node(decimal Cost, int Switches, State Previous, bool On);
@@ -57,17 +65,10 @@ public static class RatioScheduleSolver
             return new SolveResult([], 0m);
         }
 
-        // Once an on-block reaches this length, it is long enough to switch off and to stay off for the rest of the
-        // horizon, so longer blocks behave identically.
-        var cap = Math.Max(1, rules.MinOnSlots);
-        while (rules.MaxOffSlotsAfter(cap) <= n)
-        {
-            cap++;
-        }
-
         var start = history.IsOn
-            ? new State(true, Math.Min(history.OnSlots, cap))
-            : new State(false, Math.Clamp(rules.MaxOffSlotsAfter(history.OnSlots) - history.OffSlots, 0, n));
+            ? new State(true, Math.Max(0, rules.RequiredOnSlotsAfter(history.OffSlots) - history.OnSlots))
+            // Not capped: if the heating was forced off for longer than the maximum (fallback), the full off time must be made up.
+            : new State(false, history.OffSlots);
 
         var layers = new List<Dictionary<State, Node>>(n + 1)
         {
@@ -81,7 +82,7 @@ public static class RatioScheduleSolver
             {
                 foreach (var on in (ReadOnlySpan<bool>)[true, false])
                 {
-                    if (!TryStep(state, on, rules, cap, n, out var nextState))
+                    if (!TryStep(state, on, rules, out var nextState))
                     {
                         continue;
                     }
@@ -119,22 +120,23 @@ public static class RatioScheduleSolver
     private static bool IsBetter(Node a, Node b) =>
         a.Cost < b.Cost || (a.Cost == b.Cost && a.Switches < b.Switches);
 
-    private static bool TryStep(State state, bool on, RatioRules rules, int cap, int horizon, out State next)
+    private static bool TryStep(State state, bool on, RatioRules rules, out State next)
     {
         if (on)
         {
-            next = state.IsOn ? new State(true, Math.Min(state.N + 1, cap)) : new State(true, 1);
+            next = state.IsOn
+                ? new State(true, Math.Max(state.N - 1, 0))
+                : new State(true, rules.RequiredOnSlotsAfter(state.N) - 1);
             return true;
         }
 
         if (state.IsOn)
         {
-            var allowance = rules.MaxOffSlotsAfter(state.N);
-            next = new State(false, Math.Min(allowance - 1, horizon));
-            return allowance >= 1;
+            next = new State(false, 1);
+            return state.N == 0 && rules.MaxOffSlots >= 1;
         }
 
-        next = new State(false, state.N - 1);
-        return state.N >= 1;
+        next = new State(false, state.N + 1);
+        return state.N < rules.MaxOffSlots;
     }
 }

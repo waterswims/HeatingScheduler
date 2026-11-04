@@ -47,13 +47,14 @@ public sealed class HeatingSchedule : IHeatingSchedule
     public HeatingSchedule(IOptions<ScheduleOptions> options, ILogger<HeatingSchedule> logger)
     {
         _options = options.Value;
-        _rules = new RatioRules(_options.OffToOnRatio, Slots.FromMinutes(_options.MinOnMinutes));
+        _rules = new RatioRules(
+            _options.OnToOffRatio,
+            Slots.FromMinutes(_options.MinOnMinutes),
+            Slots.FromMinutes(_options.MaxOffMinutes));
         _logger = logger;
     }
 
-    public HeatingHistory StartupHistory => _options.StartupAssumedOnMinutes > 0
-        ? HeatingHistory.On(Slots.FromMinutes(_options.StartupAssumedOnMinutes))
-        : HeatingHistory.Off(0, 0);
+    public HeatingHistory StartupHistory => HeatingHistory.On(Slots.FromMinutes(_options.StartupAssumedOnMinutes));
 
     /// <summary>The plan for slots after the current one (for logging and tests).</summary>
     public IReadOnlyList<PlannedSlot> Plan
@@ -148,7 +149,7 @@ public sealed class HeatingSchedule : IHeatingSchedule
                 decision = new DesiredState(_options.FallbackState, IsFallback: true);
                 if (decision.State == HeatingState.Off && !_rules.CanBeOff(_history))
                 {
-                    _logger.LogWarning("Fallback state Off at {Slot} breaks the off:on ratio ({History})", Slots.Uk(slot), _history);
+                    _logger.LogWarning("Fallback state Off at {Slot} breaks the scheduling rules ({History})", Slots.Uk(slot), _history);
                 }
             }
             else

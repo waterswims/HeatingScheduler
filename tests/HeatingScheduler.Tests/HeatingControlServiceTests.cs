@@ -10,7 +10,7 @@ namespace HeatingScheduler.Tests;
 
 public class HeatingControlServiceTests
 {
-        private sealed class FakeWavin(params WavinDevice[] devices) : IWavinClient
+    private sealed class FakeWavin(params WavinDevice[] devices) : IWavinClient
     {
         public List<(string Device, IReadOnlyList<RoomSetpoint> Setpoints)> Sent { get; } = [];
 

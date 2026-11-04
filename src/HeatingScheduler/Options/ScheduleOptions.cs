@@ -13,19 +13,23 @@ public sealed class ScheduleOptions : IValidatableObject
     public const string SectionName = "Schedule";
 
     /// <summary>
-    /// After an on-block, the heating may be off for at most this ratio × the length of that block
-    /// (e.g. 2.0: one hour on allows up to two hours off). It may be off for less.
+    /// After an off period, the heating must be on for at least this ratio × the length of that off period
+    /// (rounded up to whole slots) to make up the heat lost. E.g. 0.5: two hours off requires at least one hour on.
     /// </summary>
-    [Range(0.1, 48.0)]
-    public double OffToOnRatio { get; set; } = 1.0;
+    [Range(0.01, 10.0)]
+    public double OnToOffRatio { get; set; } = 0.25;
 
-    /// <summary>Shortest on-block, in minutes (a multiple of 30). 30 means no minimum.</summary>
+    /// <summary>Longest allowed off period, in minutes (a multiple of 30), to limit heat loss.</summary>
+    [Range(30, 1440)]
+    public int MaxOffMinutes { get; set; } = 180;
+
+    /// <summary>Shortest on-block, in minutes (a multiple of 30). 30 means no minimum beyond the make-up time.</summary>
     [Range(30, 1440)]
     public int MinOnMinutes { get; set; } = 60;
 
     /// <summary>
-    /// After a restart, assume the heating has just finished an on-block this long (a multiple of 30, in minutes).
-    /// 0 means the heating must come on straight away.
+    /// After a restart, assume the heating has been on for this long (a multiple of 30, in minutes) with no heat left
+    /// to make up. If this is less than <see cref="MinOnMinutes"/>, the heating stays on until the minimum is reached.
     /// </summary>
     [Range(0, 1440)]
     public int StartupAssumedOnMinutes { get; set; } = 60;
@@ -39,14 +43,17 @@ public sealed class ScheduleOptions : IValidatableObject
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
     {
-        if (MinOnMinutes % 30 != 0)
+        foreach (var (name, value) in new[]
+                 {
+                     (nameof(MaxOffMinutes), MaxOffMinutes),
+                     (nameof(MinOnMinutes), MinOnMinutes),
+                     (nameof(StartupAssumedOnMinutes), StartupAssumedOnMinutes),
+                 })
         {
-            yield return new ValidationResult("MinOnMinutes must be a multiple of 30.", [nameof(MinOnMinutes)]);
-        }
-
-        if (StartupAssumedOnMinutes % 30 != 0)
-        {
-            yield return new ValidationResult("StartupAssumedOnMinutes must be a multiple of 30.", [nameof(StartupAssumedOnMinutes)]);
+            if (value % 30 != 0)
+            {
+                yield return new ValidationResult($"{name} must be a multiple of 30.", [name]);
+            }
         }
     }
 }

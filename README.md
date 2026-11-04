@@ -1,6 +1,6 @@
 # HeatingScheduler
 
-A .NET 10 worker service that runs underfloor heating at the lowest [Octopus Agile](https://octopus.energy/smart/agile/) cost, within an off:on ratio, by setting room setpoints on a **Wavin Sentio** system.
+A .NET 10 worker service that runs underfloor heating at the lowest [Octopus Agile](https://octopus.energy/smart/agile/) cost, while making up heat lost during off periods, by setting room setpoints on a **Wavin Sentio** system.
 
 It runs two background services in one process:
 
@@ -13,10 +13,14 @@ The two services share the schedule in memory.
 
 ### How the on/off schedule is chosen
 
-- **The rule:** after the heating has been on for a block of time *L*, it may then be off for at most `OffToOnRatio` × *L*. It may be off for less. On-blocks last at least `MinOnMinutes`. For example, with a ratio of 2, one hour on allows up to two hours off.
-- **The solver:** finds the on/off pattern over the next `HorizonHours` (or as far as prices are known) with the **lowest total price** that obeys the rule. It uses dynamic programming over the half-hour slots, so the result is exactly optimal, not an approximation. With positive prices this means as little on-time as the ratio allows, placed in the cheapest slots. When prices are negative, the heating comes on.
+- **The rules:**
+  - An off period lasts at most `MaxOffMinutes`, so heat loss is limited.
+  - After an off period of length *F*, the heating must stay on for at least `OnToOffRatio` × *F* (rounded up to whole half-hours) to make up the heat lost. It may stay on longer.
+  - Every on-block lasts at least `MinOnMinutes`.
+  - For example, with a ratio of 0.5 and a 3-hour maximum, 2 hours off must be followed by at least 1 hour on.
+- **The solver:** finds the on/off pattern over the next `HorizonHours` (or as far as prices are known) with the **lowest total price** that obeys the rule. It uses dynamic programming over the half-hour slots, so the result is exactly optimal, not an approximation. With positive prices it keeps the heating off through expensive periods and does the make-up heating in the cheapest slots. When prices are negative, the heating comes on.
 - **Rolling horizon:** when each half-hour slot starts, the solver re-plans from what actually happened so far. That slot's decision is then fixed. The rest of the plan is re-optimised as time passes and new prices arrive, and the log shows the plan whenever it changes.
-- **After a restart:** the history is lost, so the solver assumes the heating has just finished a `StartupAssumedOnMinutes` on-block.
+- **After a restart:** the history is lost, so the solver assumes the heating has been on for `StartupAssumedOnMinutes` with no heat left to make up.
 
 > **Notes**
 > - The Wavin Sentio cloud API is **unofficial**. It is ported from the community library [djerik/wavinsentio](https://github.com/djerik/wavinsentio). Wavin could change it without notice.
@@ -29,9 +33,10 @@ The two services share the schedule in memory.
 | `Octopus:ProductCode` | `AGILE-24-10-01` | Your Agile product. Check your Octopus account or `https://api.octopus.energy/v1/products/?brand=OCTOPUS_ENERGY`. |
 | `Octopus:RegionCode` | `C` | Region letter A–P: the last letter of your tariff code (`E-1R-AGILE-24-10-01-C`). |
 | `Octopus:FetchIntervalMinutes` | `30` | How often prices are checked. |
-| `Schedule:OffToOnRatio` | `1.0` | Maximum off time as a multiple of the preceding on-block. The allowance is rounded down to whole slots, e.g. 1.5 × 30 min allows 30 min. |
-| `Schedule:MinOnMinutes` | `60` | Shortest on-block (a multiple of 30). Use `30` for no minimum. |
-| `Schedule:StartupAssumedOnMinutes` | `60` | After a restart, assume an on-block this long has just ended (a multiple of 30). `0` forces the heating on straight away. |
+| `Schedule:OnToOffRatio` | `0.25` | Minimum on-time after an off period, as a multiple of that off period (rounded up to whole slots). For example, 0.25 means 2 h off requires at least 30 min on. |
+| `Schedule:MaxOffMinutes` | `180` | Longest allowed off period (a multiple of 30). |
+| `Schedule:MinOnMinutes` | `60` | Shortest on-block (a multiple of 30). Use `30` for no minimum beyond the make-up time. |
+| `Schedule:StartupAssumedOnMinutes` | `60` | After a restart, assume the heating has been on this long with nothing to make up (a multiple of 30). If this is below `MinOnMinutes`, the heating stays on until the minimum is reached. |
 | `Schedule:HorizonHours` | `24` | How far ahead the solver plans (rolling). |
 | `Schedule:FallbackState` | `On` | State used when there's no price for the current slot, e.g. if the Octopus API is down. |
 | `Wavin:Email` / `Wavin:Password` | — | Wavin Sentio app login. **Secret, so don't put it in appsettings.json.** |

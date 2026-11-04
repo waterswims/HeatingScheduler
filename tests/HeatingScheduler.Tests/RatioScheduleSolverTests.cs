@@ -5,29 +5,45 @@ namespace HeatingScheduler.Tests;
 public class RatioScheduleSolverTests
 {
     /// <summary>
-    /// Independent check of the rules, written directly from the definition rather than the solver's state machine.
-    /// The final on-block may be cut short by the end of the horizon.
+    /// Independent check of the rules, written directly from the definition rather than the solver's state machine:
+    /// off periods last at most <paramref name="maxOff"/> slots, and each on-block lasts at least
+    /// max(<paramref name="minOn"/>, ⌈ratio × the preceding off period⌉). The final on-block may be cut short by the
+    /// end of the horizon.
     /// </summary>
-    internal static bool IsValid(IReadOnlyList<bool> on, HeatingHistory history, double ratio, int minOnSlots)
+    internal static bool IsValid(IReadOnlyList<bool> on, HeatingHistory history, double ratio, int minOn, int maxOff)
     {
-        int MaxOff(int onSlots) => onSlots < minOnSlots ? 0 : (int)Math.Floor(ratio * onSlots + 1e-9);
+        int Required(int offSlots) => Math.Max(minOn, (int)Math.Ceiling(ratio * offSlots - 1e-9));
 
         var isOn = history.IsOn;
         var onLen = history.OnSlots;
-        var offLen = history.OffSlots;
+        var offLen = history.OffSlots;      // when on: the off period before this on-block
         foreach (var slotOn in on)
         {
             if (slotOn)
             {
-                onLen = isOn ? onLen + 1 : 1;
-                offLen = 0;
+                if (!isOn)
+                {
+                    onLen = 0;              // offLen now holds the off period this block must make up for
+                }
+
+                onLen++;
                 isOn = true;
             }
             else
             {
-                offLen = isOn ? 1 : offLen + 1;
+                if (isOn)
+                {
+                    if (onLen < Required(offLen))
+                    {
+                        return false;
+                    }
+
+                    offLen = 0;
+                }
+
+                offLen++;
                 isOn = false;
-                if (offLen > MaxOff(onLen))
+                if (offLen > maxOff)
                 {
                     return false;
                 }
@@ -40,14 +56,15 @@ public class RatioScheduleSolverTests
     private static decimal Cost(IReadOnlyList<bool> on, IReadOnlyList<decimal> prices) =>
         on.Select((o, i) => o ? prices[i] : 0m).Sum();
 
-    public static TheoryData<double, int, bool, int, int> BruteForceCases()
+    public static TheoryData<double, int, int, bool, int, int> BruteForceCases()
     {
-        var data = new TheoryData<double, int, bool, int, int>();
-        foreach (var ratio in new[] { 0.5, 1.0, 1.5, 2.0, 3.0 })
-        foreach (var minOn in new[] { 1, 2, 3 })
-        foreach (var (isOn, onSlots, offSlots) in new[] { (true, 1, 0), (true, 2, 0), (false, 2, 1), (false, 0, 0), (false, 4, 0) })
+        var data = new TheoryData<double, int, int, bool, int, int>();
+        foreach (var ratio in new[] { 0.25, 0.5, 1.0, 1.5, 2.0 })
+        foreach (var minOn in new[] { 1, 2 })
+        foreach (var maxOff in new[] { 1, 3, 6 })
+        foreach (var (isOn, onSlots, offSlots) in new[] { (true, 2, 0), (true, 1, 4), (false, 0, 1), (false, 0, 3) })
         {
-            data.Add(ratio, minOn, isOn, onSlots, offSlots);
+            data.Add(ratio, minOn, maxOff, isOn, onSlots, offSlots);
         }
 
         return data;
@@ -55,11 +72,11 @@ public class RatioScheduleSolverTests
 
     [Theory]
     [MemberData(nameof(BruteForceCases))]
-    public void Matches_brute_force_optimum(double ratio, int minOn, bool isOn, int onSlots, int offSlots)
+    public void Matches_brute_force_optimum(double ratio, int minOn, int maxOff, bool isOn, int onSlots, int offSlots)
     {
         var history = new HeatingHistory(isOn, onSlots, offSlots);
-        var rules = new RatioRules(ratio, minOn);
-        var random = new Random(HashCode.Combine(ratio, minOn, isOn, onSlots, offSlots) & 0x7fffffff);
+        var rules = new RatioRules(ratio, minOn, maxOff);
+        var random = new Random(HashCode.Combine(ratio, minOn, maxOff, isOn, onSlots, offSlots) & 0x7fffffff);
         const int n = 12;
 
         for (var trial = 0; trial < 5; trial++)
@@ -70,7 +87,7 @@ public class RatioScheduleSolverTests
             for (var mask = 0; mask < 1 << n; mask++)
             {
                 var candidate = Enumerable.Range(0, n).Select(i => (mask >> i & 1) == 1).ToArray();
-                if (IsValid(candidate, history, ratio, minOn))
+                if (IsValid(candidate, history, ratio, minOn, maxOff))
                 {
                     best = Math.Min(best, Cost(candidate, prices));
                 }
@@ -78,79 +95,99 @@ public class RatioScheduleSolverTests
 
             var result = RatioScheduleSolver.Solve(prices, history, rules);
 
-            Assert.True(IsValid(result.On, history, ratio, minOn), $"Invalid plan for prices [{string.Join(",", prices)}]");
+            Assert.True(IsValid(result.On, history, ratio, minOn, maxOff), $"Invalid plan for prices [{string.Join(",", prices)}]");
             Assert.Equal(Cost(result.On, prices), result.Cost);
             Assert.Equal(best, result.Cost);
         }
     }
 
     [Fact]
-    public void Heats_during_cheap_block_to_earn_off_time_during_peak()
+    public void Off_through_the_peak_then_makes_up_the_heat()
     {
-        // 4 cheap slots then 8 expensive ones; ratio 2 means 4 slots on allow 8 off.
-        decimal[] prices = [1, 1, 1, 1, 100, 100, 100, 100, 100, 100, 100, 100];
-        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.Off(0, 0), new RatioRules(2.0, 1));
+        // Expensive peak for 4 slots, then cheap. Ratio 0.5: 4 slots off requires at least 2 on afterwards.
+        decimal[] prices = [100, 100, 100, 100, 1, 1, 50, 50];
+        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(2), new RatioRules(0.5, 1, 4));
 
-        Assert.Equal([true, true, true, true, false, false, false, false, false, false, false, false], result.On);
-        Assert.Equal(4m, result.Cost);
+        Assert.Equal([false, false, false, false, true, true, false, false], result.On);
     }
 
     [Fact]
-    public void Always_heats_when_prices_are_negative()
+    public void Off_period_never_exceeds_maximum()
     {
-        decimal[] prices = [-5, -1, 20, 20, -3, 20];
-        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(10), new RatioRules(10.0, 1));
+        var prices = Enumerable.Repeat(100m, 12).ToArray();
+        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(2), new RatioRules(0.5, 1, 3));
 
-        Assert.True(result.On[0]);
-        Assert.True(result.On[1]);
-        Assert.True(result.On[4]);
-        Assert.False(result.On[2]);
+        Assert.True(IsValid(result.On, HeatingHistory.On(2), 0.5, 1, 3));
+        Assert.True(LongestRun(result.On, false) <= 3);
+
+        // 2 off + 1 on (⌈0.5 × 2⌉) is the most efficient block, ending with the maximum 3 off: 2+1+2+1+2+1+3 = 12.
+        Assert.Equal(300m, result.Cost);
     }
 
     [Fact]
-    public void Respects_minimum_on_block()
+    public void Makes_up_full_off_time_forced_beyond_maximum()
     {
-        // Single cheap slots between expensive ones would be ideal, but on-blocks must be 3 slots long.
-        decimal[] prices = [1, 50, 50, 1, 50, 50, 1, 50, 50, 1, 50, 50];
-        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.Off(0, 0), new RatioRules(1.0, 3));
+        // Forced off for 6 slots (e.g. fallback) with a maximum of 3: must switch on and make up ⌈0.5 × 6⌉ = 3 slots.
+        decimal[] prices = [100, 100, 100, 100, 100];
+        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.Off(6), new RatioRules(0.5, 1, 3));
 
-        Assert.True(IsValid(result.On, HeatingHistory.Off(0, 0), 1.0, 3));
-        var runs = Runs(result.On).Where(r => r.On).ToList();
-        Assert.All(runs.SkipLast(1), r => Assert.True(r.Length >= 3));
+        Assert.Equal([true, true, true, false, false], result.On);
+    }
+
+    private static int LongestRun(IReadOnlyList<bool> on, bool state)
+    {
+        int best = 0, current = 0;
+        foreach (var s in on)
+        {
+            current = s == state ? current + 1 : 0;
+            best = Math.Max(best, current);
+        }
+
+        return best;
     }
 
     [Fact]
-    public void Off_allowance_is_rounded_down_for_fractional_ratio()
+    public void Make_up_time_is_rounded_up()
     {
-        var rules = new RatioRules(1.5, 1);
-        Assert.Equal(1, rules.MaxOffSlotsAfter(1));
-        Assert.Equal(3, rules.MaxOffSlotsAfter(2));
-        Assert.Equal(4, rules.MaxOffSlotsAfter(3));
+        var rules = new RatioRules(0.25, 1, 12);
+        Assert.Equal(1, rules.RequiredOnSlotsAfter(1)); // 0.25 → 1
+        Assert.Equal(1, rules.RequiredOnSlotsAfter(4)); // exactly 1
+        Assert.Equal(2, rules.RequiredOnSlotsAfter(5)); // 1.25 → 2
+        Assert.Equal(3, new RatioRules(0.25, 3, 12).RequiredOnSlotsAfter(4)); // MinOn wins
     }
 
     [Fact]
-    public void Honours_history_off_allowance()
+    public void Heats_through_negative_prices_even_mid_off_period()
     {
-        // Off for 1 slot after 2 on with ratio 1.5 → 2 more off slots allowed, then must heat.
+        // A single negative slot during what would otherwise be an off period is still taken.
+        decimal[] prices = [50, 50, -40, 50, 50, 50];
+        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.Off(1), new RatioRules(0.25, 1, 6));
+
+        Assert.True(result.On[2]);
+    }
+
+    [Fact]
+    public void Must_finish_make_up_time_from_history()
+    {
+        // On for 1 slot after 4 slots off with ratio 0.75 → 3 required, so 2 more on before it can switch off.
         decimal[] prices = [100, 100, 100, 100];
-        var history = HeatingHistory.Off(2, 1);
-        var result = RatioScheduleSolver.Solve(prices, history, new RatioRules(1.5, 1));
+        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(1, afterOffSlots: 4), new RatioRules(0.75, 1, 4));
 
-        Assert.Equal([false, false, true, false], result.On);
+        Assert.Equal([true, true, false, false], result.On);
     }
 
     [Fact]
-    public void Must_continue_on_block_shorter_than_minimum()
+    public void Must_switch_on_when_off_history_reaches_maximum()
     {
         decimal[] prices = [100, 1, 1, 1];
-        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(1), new RatioRules(5.0, 2));
+        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.Off(3), new RatioRules(0.5, 1, 3));
         Assert.True(result.On[0]);
     }
 
     [Fact]
     public void Empty_horizon_returns_empty_plan()
     {
-        var result = RatioScheduleSolver.Solve([], HeatingHistory.On(2), new RatioRules(1.0, 2));
+        var result = RatioScheduleSolver.Solve([], HeatingHistory.On(2), new RatioRules(0.5, 2, 6));
         Assert.Empty(result.On);
     }
 
@@ -158,26 +195,10 @@ public class RatioScheduleSolverTests
     public void Solves_a_full_day_quickly()
     {
         var random = new Random(1);
-        var prices = Enumerable.Range(0, 48).Select(_ => (decimal)random.Next(5, 50)).ToArray();
+        var prices = Enumerable.Range(0, 96).Select(_ => (decimal)random.Next(5, 50)).ToArray();
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(2), new RatioRules(0.1, 2));
+        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(2), new RatioRules(0.1, 2, 48));
         Assert.True(sw.ElapsedMilliseconds < 2000);
-        Assert.True(IsValid(result.On, HeatingHistory.On(2), 0.1, 2));
-    }
-
-    private static IEnumerable<(bool On, int Length)> Runs(IReadOnlyList<bool> on)
-    {
-        var i = 0;
-        while (i < on.Count)
-        {
-            var j = i;
-            while (j < on.Count && on[j] == on[i])
-            {
-                j++;
-            }
-
-            yield return (on[i], j - i);
-            i = j;
-        }
+        Assert.True(IsValid(result.On, HeatingHistory.On(2), 0.1, 2, 48));
     }
 }
