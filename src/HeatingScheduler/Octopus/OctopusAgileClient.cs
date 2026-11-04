@@ -12,6 +12,8 @@ public interface IOctopusAgileClient
 
 public sealed class OctopusAgileClient(HttpClient httpClient, IOptions<OctopusOptions> options) : IOctopusAgileClient
 {
+    public static readonly Uri BaseAddress = new("https://api.octopus.energy/");
+
     private const int MaxPages = 20;
 
     public async Task<IReadOnlyList<AgileSlot>> GetRatesAsync(

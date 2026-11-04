@@ -22,18 +22,21 @@ public interface IHeatingSchedule
 /// <summary>
 /// Thread-safe store of known prices and committed slot decisions, shared by both background services.
 /// <para>
-/// Works as a rolling-horizon planner: when a slot starts, the solver plans the next <see cref="ScheduleOptions.HorizonHours"/>
+/// Works as a rolling-horizon planner: when a slot starts, the solver plans the next <see cref="Horizon"/>
 /// (or as far as prices are known) from the actual history, and the first slot of that plan is committed.
 /// Committed slots never change; the rest of the plan is recomputed as time passes and new prices arrive.
 /// </para>
 /// </summary>
 public sealed class HeatingSchedule : IHeatingSchedule
 {
+    /// <summary>How far ahead the solver plans (rolling), limited by how far ahead prices are published.</summary>
+    public static readonly TimeSpan Horizon = TimeSpan.FromHours(24);
+
     private static readonly TimeSpan MaxCatchUp = TimeSpan.FromHours(24);
 
     private readonly ScheduleOptions _options;
-    private readonly RatioRules _rules;
     private readonly ILogger<HeatingSchedule> _logger;
+    private RatioRules _rules;
     private readonly Lock _lock = new();
     private readonly SortedDictionary<DateTimeOffset, decimal> _prices = [];
     private readonly Dictionary<DateTimeOffset, DesiredState> _committed = [];
@@ -59,6 +62,35 @@ public sealed class HeatingSchedule : IHeatingSchedule
     /// minimum on-block with no heat left to make up, so the solver is free to switch off straight away.
     /// </summary>
     public HeatingHistory StartupHistory => HeatingHistory.On(_rules.MinOnSlots);
+
+    /// <summary>The rules currently in force (initially from <see cref="ScheduleOptions"/>, then as tuned).</summary>
+    public RatioRules Rules
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _rules;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Replaces the make-up ratio and maximum off period (e.g. from measured room temperatures) and re-plans.
+    /// Decisions already committed are unaffected.
+    /// </summary>
+    public void UpdateRules(double onToOffRatio, int maxOffSlots)
+    {
+        lock (_lock)
+        {
+            _rules = _rules with { OnToOffRatio = onToOffRatio, MaxOffSlots = maxOffSlots };
+            if (_nextSlot is { } next)
+            {
+                _plan = PlanFrom(next);
+                LogPlanIfChanged();
+            }
+        }
+    }
 
     /// <summary>The plan for slots after the current one (for logging and tests).</summary>
     public IReadOnlyList<PlannedSlot> Plan
@@ -189,7 +221,7 @@ public sealed class HeatingSchedule : IHeatingSchedule
     /// <summary>Solves the schedule from <paramref name="from"/> over the known prices within the horizon, starting from the current history.</summary>
     private List<PlannedSlot> PlanFrom(DateTimeOffset from)
     {
-        var end = from + TimeSpan.FromHours(_options.HorizonHours);
+        var end = from + Horizon;
         var starts = new List<DateTimeOffset>();
         var prices = new List<decimal>();
         for (var t = from; t < end && _prices.TryGetValue(t, out var price); t += Slots.Length)

@@ -1,6 +1,4 @@
 using HeatingScheduler.Octopus;
-using HeatingScheduler.Options;
-using Microsoft.Extensions.Options;
 
 namespace HeatingScheduler.Scheduling;
 
@@ -11,15 +9,15 @@ namespace HeatingScheduler.Scheduling;
 public sealed class PriceFetchService(
     IOctopusAgileClient octopus,
     HeatingSchedule schedule,
-    IOptions<OctopusOptions> octopusOptions,
-    IOptions<ScheduleOptions> scheduleOptions,
     TimeProvider timeProvider,
     ILogger<PriceFetchService> logger) : BackgroundService
 {
+    /// <summary>How often to check for new prices while the horizon isn't fully priced.</summary>
+    public static readonly TimeSpan FetchInterval = TimeSpan.FromMinutes(30);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        using var timer = new PeriodicTimer(
-            TimeSpan.FromMinutes(octopusOptions.Value.FetchIntervalMinutes), timeProvider);
+        using var timer = new PeriodicTimer(FetchInterval, timeProvider);
         do
         {
             try
@@ -44,7 +42,7 @@ public sealed class PriceFetchService(
     {
         var now = timeProvider.GetUtcNow();
         var current = Slots.StartFor(now);
-        var horizonEnd = current + TimeSpan.FromHours(scheduleOptions.Value.HorizonHours);
+        var horizonEnd = current + HeatingSchedule.Horizon;
 
         var knownUntil = schedule.PricesKnownUntil(current);
         if (knownUntil >= horizonEnd)

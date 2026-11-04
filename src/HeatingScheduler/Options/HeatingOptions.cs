@@ -12,10 +12,6 @@ public sealed class HeatingOptions : IValidatableObject
     [Range(5.0, 35.0)]
     public double OffTemperature { get; set; } = 17.0;
 
-    /// <summary>Longest time between checks of the Wavin setpoints. Checks also happen at every half-hour slot boundary.</summary>
-    [Range(1, 60)]
-    public int MaxCheckIntervalMinutes { get; set; } = 5;
-
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
     {
         if (OffTemperature >= OnTemperature)

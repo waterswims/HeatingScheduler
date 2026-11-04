@@ -30,7 +30,6 @@ public class HeatingScheduleTests
                 OnToOffRatio = ratio,
                 MaxOffMinutes = maxOffMinutes,
                 MinOnMinutes = minOnMinutes,
-                HorizonHours = 24,
                 FallbackState = fallback,
             }),
             NullLogger<HeatingSchedule>.Instance);
@@ -95,6 +94,21 @@ public class HeatingScheduleTests
     }
 
     [Fact]
+    public void UpdateRules_replans_with_new_maximum_off_period()
+    {
+        // Expensive for 10 slots, then cheap: with a 5h maximum the plan stays off throughout.
+        var schedule = Create(ratio: 0.25, maxOffMinutes: 300);
+        schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 16, i => i < 10 ? 100m : 1m), T0);
+        schedule.GetDesiredState(T0);
+        Assert.DoesNotContain(schedule.Plan.Take(9), p => p.State == HeatingState.On);
+
+        // Tighter maximum (1h): the plan must now heat during the expensive period.
+        schedule.UpdateRules(0.25, maxOffSlots: 2);
+        Assert.Equal(2, schedule.Rules.MaxOffSlots);
+        Assert.Contains(schedule.Plan.Take(9), p => p.State == HeatingState.On);
+    }
+
+    [Fact]
     public void PricesKnownUntil_stops_at_first_gap()
     {
         var schedule = Create();
@@ -136,12 +150,9 @@ public class PriceFetchServiceTests
 
     private static (PriceFetchService Service, HeatingSchedule Schedule) Create(FakeOctopus octopus, DateTimeOffset now)
     {
-        var scheduleOptions = TestHelpers.Opt(new ScheduleOptions { HorizonHours = 24 });
-        var schedule = new HeatingSchedule(scheduleOptions, NullLogger<HeatingSchedule>.Instance);
+        var schedule = new HeatingSchedule(TestHelpers.Opt(new ScheduleOptions()), NullLogger<HeatingSchedule>.Instance);
         var service = new PriceFetchService(
             octopus, schedule,
-            TestHelpers.Opt(new OctopusOptions { ProductCode = "AGILE-24-10-01", RegionCode = "H" }),
-            scheduleOptions,
             new FakeTimeProvider(now),
             NullLogger<PriceFetchService>.Instance);
         return (service, schedule);

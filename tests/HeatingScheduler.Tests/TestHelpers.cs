@@ -25,10 +25,15 @@ internal sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> 
 {
     public List<(HttpRequestMessage Request, string? Body)> Requests { get; } = [];
 
+    /// <summary>Raw request bodies, in the same order as <see cref="Requests"/>.</summary>
+    public List<byte[]?> RawBodies { get; } = [];
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        var body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
+        var raw = request.Content is null ? null : await request.Content.ReadAsByteArrayAsync(cancellationToken);
+        var body = raw is null ? null : System.Text.Encoding.UTF8.GetString(raw);
         Requests.Add((request, body));
+        RawBodies.Add(raw);
         return respond(request);
     }
 

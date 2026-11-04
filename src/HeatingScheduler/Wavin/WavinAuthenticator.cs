@@ -13,6 +13,11 @@ public sealed class WavinAuthenticator(
     ILogger<WavinAuthenticator> logger)
 {
     public const string HttpClientName = "WavinAuth";
+
+    /// <summary>Public Firebase web API key used by the Wavin Sentio app.</summary>
+    private const string FirebaseApiKey = "AIzaSyBlAtNI7-2jitPul9I-O4EZcT-n0sIay-g";
+    private static readonly Uri SignInUrl =
+        new($"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FirebaseApiKey}");
     private static readonly TimeSpan ExpiryMargin = TimeSpan.FromMinutes(5);
 
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -55,16 +60,23 @@ public sealed class WavinAuthenticator(
     {
         var o = options.Value;
         var client = httpClientFactory.CreateClient(HttpClientName);
-        var url = new Uri(o.AuthBaseUrl, $"v1/accounts:signInWithPassword?key={Uri.EscapeDataString(o.FirebaseApiKey)}");
 
         using var response = await client.PostAsJsonAsync(
-            url, new FirebaseSignInRequest { Email = o.Email, Password = o.Password }, cancellationToken);
+            SignInUrl, new FirebaseSignInRequest { Email = o.Email, Password = o.Password }, cancellationToken);
 
         if (!response.IsSuccessStatusCode)
         {
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
-            throw new HttpRequestException(
-                $"Wavin sign-in failed with {(int)response.StatusCode}: {body}", null, response.StatusCode);
+            var message = $"Wavin sign-in failed with {(int)response.StatusCode}: {body}";
+
+            // A rejected login (e.g. wrong password) won't succeed on retry, and repeated attempts get the account
+            // throttled (TOO_MANY_ATTEMPTS_TRY_LATER). Throw a type the HTTP retry policy doesn't treat as transient.
+            if ((int)response.StatusCode is >= 400 and < 500 and not 408 and not 429)
+            {
+                throw new WavinSignInException(message);
+            }
+
+            throw new HttpRequestException(message, null, response.StatusCode);
         }
 
         var result = await response.Content.ReadFromJsonAsync<FirebaseSignInResponse>(cancellationToken)
@@ -80,3 +92,6 @@ public sealed class WavinAuthenticator(
         return _token;
     }
 }
+
+/// <summary>The Wavin login was rejected (for example, wrong email or password). Not retried automatically.</summary>
+public sealed class WavinSignInException(string message) : Exception(message);

@@ -27,10 +27,6 @@ public sealed class ScheduleOptions : IValidatableObject
     [Range(30, 1440)]
     public int MinOnMinutes { get; set; } = 60;
 
-    /// <summary>How far ahead (rolling) the solver plans, limited by how far ahead prices are published.</summary>
-    [Range(1, 48)]
-    public int HorizonHours { get; set; } = 24;
-
     /// <summary>State used when there is no price for the current slot (e.g. prices could not be fetched).</summary>
     public HeatingState FallbackState { get; set; } = HeatingState.On;
 

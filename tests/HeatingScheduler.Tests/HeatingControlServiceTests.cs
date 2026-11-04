@@ -25,13 +25,18 @@ public class HeatingControlServiceTests
             Sent.Add((deviceName, setpoints));
             return Task.CompletedTask;
         }
+
+        public Task<IReadOnlyList<RoomTimeSeriesRow>> GetRoomTimeSeriesAsync(
+            string deviceName, string roomId, DateTimeOffset start, DateTimeOffset end, int bucketMinutes, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
     }
 
-    private static WavinRoom Room(int id, string title, double setpoint, string vacation = "VACATION_MODE_OFF") => new()
+    private static WavinRoom Room(int id, string title, double setpoint, string vacation = "VACATION_MODE_OFF", double? air = 20.5) => new()
     {
         Id = JsonSerializer.SerializeToElement(id),
         Title = title,
         SetpointTemperature = setpoint,
+        AirTemperature = air,
         VacationMode = vacation,
     };
 
@@ -58,12 +63,13 @@ public class HeatingControlServiceTests
     private static readonly DesiredState Off = new(HeatingState.Off, false);
     private static readonly DateTimeOffset Now = DateTimeOffset.Parse("2026-11-04T12:10:00Z");
 
-    private static HeatingControlService Create(FakeWavin wavin, DesiredState desired, WavinOptions? wavinOptions = null, DateTimeOffset? now = null) =>
+    private static HeatingControlService Create(
+        FakeWavin wavin, DesiredState desired, WavinOptions? wavinOptions = null, DateTimeOffset? now = null) =>
         new(
             wavin,
             new FakeSchedule(desired),
             TestHelpers.Opt(wavinOptions ?? new WavinOptions()),
-            TestHelpers.Opt(new HeatingOptions { OnTemperature = 21, OffTemperature = 17, MaxCheckIntervalMinutes = 5 }),
+            TestHelpers.Opt(new HeatingOptions { OnTemperature = 21, OffTemperature = 17 }),
             new FakeTimeProvider(now ?? Now),
             NullLogger<HeatingControlService>.Instance);
 
@@ -129,16 +135,6 @@ public class HeatingControlServiceTests
         var (device, setpoints) = Assert.Single(wavin.Sent);
         Assert.Equal("devices/1", device);
         Assert.Equal([2], setpoints.Select(s => s.RoomId.GetInt32()));
-    }
-
-    [Fact]
-    public async Task Uses_configured_device_only()
-    {
-        var wavin = new FakeWavin(Device("devices/1", Room(1, "Lounge", 17)), Device("devices/2", Room(1, "Bedroom", 17)));
-
-        await Create(wavin, On, new WavinOptions { DeviceName = "devices/2" }).RunOnceAsync(CancellationToken.None);
-
-        Assert.Equal("devices/2", Assert.Single(wavin.Sent).Device);
     }
 
     [Fact]

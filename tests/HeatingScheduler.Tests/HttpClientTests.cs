@@ -3,6 +3,7 @@ using System.Text.Json;
 using HeatingScheduler.Octopus;
 using HeatingScheduler.Options;
 using HeatingScheduler.Wavin;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
 
@@ -108,6 +109,85 @@ public class WavinClientTests
         Assert.Equal(
             """{"device_name":"devices/abc","config":{"timestamp":"2026-11-02T12:00:00.000000Z","sentio":{"rooms":[{"id":"7","setpointTemperature":21}]}}}""",
             body);
+    }
+
+    private static byte[] Frame(byte flags, string json)
+    {
+        var payload = System.Text.Encoding.UTF8.GetBytes(json);
+        var frame = new byte[5 + payload.Length];
+        frame[0] = flags;
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(1, 4), payload.Length);
+        payload.CopyTo(frame, 5);
+        return frame;
+    }
+
+    private static HttpResponseMessage Stream(params byte[][] frames) =>
+        new(HttpStatusCode.OK) { Content = new ByteArrayContent(frames.SelectMany(f => f).ToArray()) };
+
+    [Fact]
+    public async Task GetRoomTimeSeries_sends_connect_envelope_and_parses_stream()
+    {
+        var (client, api, _) = Create((_, _) => Stream(
+            Frame(0, """{"timestamp":"2026-11-03T17:00:00Z","airTemperature":22.63,"floorTemperature":22.67,"humidity":49.42,"setpointTemperature":16}"""),
+            Frame(0, """{"timestamp":"2026-11-03T17:05:00Z","airTemperature":22.6,"setpointTemperature":23}"""),
+            Frame(2, "{}")));
+
+        var rows = await client.GetRoomTimeSeriesAsync(
+            "devices/abc", "551559482",
+            DateTimeOffset.Parse("2026-11-03T17:00:00Z"), DateTimeOffset.Parse("2026-11-04T17:00:00Z"), 5, CancellationToken.None);
+
+        Assert.Equal(2, rows.Count);
+        Assert.Equal(DateTimeOffset.Parse("2026-11-03T17:00:00Z"), rows[0].Timestamp);
+        Assert.Equal(22.63, rows[0].AirTemperature);
+        Assert.Equal(16, rows[0].SetpointTemperature);
+        Assert.Null(rows[1].FloorTemperature);
+
+        var (request, _) = Assert.Single(api.Requests);
+        Assert.EndsWith("/wavin.blaze.v1.BlazeDeviceService/GetSentioRoomTimeSeries", request.RequestUri!.ToString());
+        Assert.Equal("application/connect+json", request.Content!.Headers.ContentType!.MediaType);
+        Assert.Equal("1", Assert.Single(request.Headers.GetValues("Connect-Protocol-Version")));
+
+        var sent = api.RawBodies[0]!;
+        Assert.Equal(0, sent[0]);
+        var length = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(sent.AsSpan(1, 4));
+        Assert.Equal(sent.Length - 5, length);
+        using var json = JsonDocument.Parse(sent.AsMemory(5));
+        Assert.Equal("devices/abc", json.RootElement.GetProperty("deviceName").GetString());
+        Assert.Equal("551559482", json.RootElement.GetProperty("roomId").GetString());
+        Assert.Equal("2026-11-03T17:00:00Z", json.RootElement.GetProperty("startTime").GetString());
+        Assert.Equal("5", json.RootElement.GetProperty("bucketIntervalMinutes").GetString());
+    }
+
+    [Fact]
+    public async Task GetRoomTimeSeries_throws_on_stream_error()
+    {
+        var (client, _, _) = Create((_, _) => Stream(Frame(2, """{"error":{"code":"permission_denied","message":"nope"}}""")));
+
+        var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetRoomTimeSeriesAsync(
+            "devices/abc", "1", DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow, 5, CancellationToken.None));
+        Assert.Contains("permission_denied", ex.Message);
+    }
+
+    [Fact]
+    public async Task Rejected_login_is_not_retried_by_resilience_pipeline()
+    {
+        var authHandler = new StubHandler(_ => StubHandler.Json(
+            """{"error":{"code":400,"message":"INVALID_LOGIN_CREDENTIALS"}}""", HttpStatusCode.BadRequest));
+        var authenticator = new WavinAuthenticator(
+            new SingleClientFactory(new HttpClient(authHandler)),
+            TestHelpers.Opt(new WavinOptions { Email = "me@example.com", Password = "wrong" }),
+            new FakeTimeProvider(), NullLogger<WavinAuthenticator>.Instance);
+
+        // Same pipeline as Program.cs: standard resilience handler (outer) around the auth handler (inner).
+        var services = new ServiceCollection();
+        var http = services.AddHttpClient("wavin")
+            .ConfigurePrimaryHttpMessageHandler(() => new StubHandler(_ => StubHandler.Json("{}")));
+        http.AddStandardResilienceHandler();
+        http.AddHttpMessageHandler(() => new WavinAuthHandler(authenticator));
+        var client = services.BuildServiceProvider().GetRequiredService<IHttpClientFactory>().CreateClient("wavin");
+
+        await Assert.ThrowsAsync<WavinSignInException>(() => client.GetAsync("https://blaze.wavinsentio.com/x"));
+        Assert.Single(authHandler.Requests);
     }
 
     [Fact]

@@ -20,6 +20,9 @@ public sealed class HeatingControlService(
     private const double Tolerance = 0.05;
     private static readonly TimeSpan SlotBoundaryDelay = TimeSpan.FromSeconds(15);
 
+    /// <summary>Longest time between checks, so changes made in the Wavin app are put back promptly.</summary>
+    public static readonly TimeSpan MaxCheckInterval = TimeSpan.FromMinutes(5);
+
     private readonly HashSet<string> _warnedUnmatchedRooms = new(StringComparer.OrdinalIgnoreCase);
     private DesiredState? _lastDesired;
 
@@ -53,12 +56,11 @@ public sealed class HeatingControlService(
         }
     }
 
-    /// <summary>Wait until just after the next half-hour slot boundary, but never longer than MaxCheckIntervalMinutes.</summary>
+    /// <summary>Wait until just after the next half-hour slot boundary, but never longer than <see cref="MaxCheckInterval"/>.</summary>
     public TimeSpan NextDelay(DateTimeOffset now)
     {
         var untilNextSlot = Slots.StartFor(now) + Slots.Length + SlotBoundaryDelay - now;
-        var max = TimeSpan.FromMinutes(heatingOptions.Value.MaxCheckIntervalMinutes);
-        return untilNextSlot < max ? untilNextSlot : max;
+        return untilNextSlot < MaxCheckInterval ? untilNextSlot : MaxCheckInterval;
     }
 
     public async Task RunOnceAsync(CancellationToken cancellationToken)
@@ -112,19 +114,10 @@ public sealed class HeatingControlService(
 
     private async Task<IReadOnlyList<WavinDevice>> GetDevicesAsync(CancellationToken cancellationToken)
     {
-        var names = string.IsNullOrWhiteSpace(wavinOptions.Value.DeviceName)
-            ? (await wavin.ListDevicesAsync(cancellationToken)).Where(d => d.IsMigrated).Select(d => d.Name).ToList()
-            : [wavinOptions.Value.DeviceName];
-
-        if (names.Count == 0)
+        var devices = await wavin.GetDevicesAsync(cancellationToken);
+        if (devices.Count == 0)
         {
             logger.LogWarning("No supported Wavin Sentio devices found on the account");
-        }
-
-        var devices = new List<WavinDevice>(names.Count);
-        foreach (var name in names)
-        {
-            devices.Add(await wavin.GetDeviceAsync(name, cancellationToken));
         }
 
         return devices;
@@ -133,17 +126,7 @@ public sealed class HeatingControlService(
     private IEnumerable<WavinRoom> SelectRooms(IReadOnlyList<WavinRoom> rooms)
     {
         var filter = wavinOptions.Value.Rooms;
-        if (filter.Count == 0)
-        {
-            return rooms;
-        }
-
-        bool Matches(WavinRoom room, string entry) =>
-            string.Equals(room.IdText, entry, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(room.Title, entry, StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(room.TitlePersonalized, entry, StringComparison.OrdinalIgnoreCase);
-
-        foreach (var entry in filter.Where(e => !rooms.Any(r => Matches(r, e))))
+        foreach (var entry in filter.Where(e => !rooms.Any(r => WavinSelection.Matches(r, e))))
         {
             if (_warnedUnmatchedRooms.Add(entry))
             {
@@ -153,6 +136,6 @@ public sealed class HeatingControlService(
             }
         }
 
-        return rooms.Where(r => filter.Any(e => Matches(r, e)));
+        return WavinSelection.SelectRooms(rooms, filter);
     }
 }

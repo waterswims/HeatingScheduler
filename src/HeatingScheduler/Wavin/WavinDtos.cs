@@ -63,6 +63,16 @@ public sealed class WavinRoom
 
 public sealed record RoomSetpoint(JsonElement RoomId, double SetpointTemperature);
 
+/// <summary>One bucket of a room's history from <c>GetSentioRoomTimeSeries</c>.</summary>
+public sealed class RoomTimeSeriesRow
+{
+    [JsonPropertyName("timestamp")] public DateTimeOffset Timestamp { get; set; }
+    [JsonPropertyName("airTemperature")] public double? AirTemperature { get; set; }
+    [JsonPropertyName("floorTemperature")] public double? FloorTemperature { get; set; }
+    [JsonPropertyName("humidity")] public double? Humidity { get; set; }
+    [JsonPropertyName("setpointTemperature")] public double? SetpointTemperature { get; set; }
+}
+
 internal sealed class SendDeviceConfigRequest
 {
     [JsonPropertyName("device_name")] public required string DeviceName { get; init; }

@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Globalization;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
@@ -10,14 +12,20 @@ public interface IWavinClient
     Task<IReadOnlyList<WavinDevice>> ListDevicesAsync(CancellationToken cancellationToken);
     Task<WavinDevice> GetDeviceAsync(string deviceName, CancellationToken cancellationToken);
     Task SetRoomSetpointsAsync(string deviceName, IReadOnlyList<RoomSetpoint> setpoints, CancellationToken cancellationToken);
+
+    /// <summary>Historical readings for one room, aggregated into <paramref name="bucketMinutes"/>-minute buckets.</summary>
+    Task<IReadOnlyList<RoomTimeSeriesRow>> GetRoomTimeSeriesAsync(
+        string deviceName, string roomId, DateTimeOffset start, DateTimeOffset end, int bucketMinutes, CancellationToken cancellationToken);
 }
 
 /// <summary>
 /// Client for the (unofficial) Wavin Sentio "Blaze" device service, as used by the Wavin Sentio app.
-/// Base address must be set to the device service host; authentication is added by <see cref="WavinAuthHandler"/>.
+/// The HttpClient's base address must be <see cref="BaseAddress"/>; authentication is added by <see cref="WavinAuthHandler"/>.
 /// </summary>
 public sealed class WavinClient(HttpClient httpClient, TimeProvider timeProvider) : IWavinClient
 {
+    public static readonly Uri BaseAddress = new("https://blaze.wavinsentio.com/");
+
     private const string ServicePath = "wavin.blaze.v1.BlazeDeviceService/";
 
     public async Task<IReadOnlyList<WavinDevice>> ListDevicesAsync(CancellationToken cancellationToken)
@@ -53,6 +61,67 @@ public sealed class WavinClient(HttpClient httpClient, TimeProvider timeProvider
         };
 
         using var response = await SendAsync("SendDeviceConfig", body, cancellationToken);
+    }
+
+    /// <summary>
+    /// Calls the server-streaming <c>GetSentioRoomTimeSeries</c> method using the Connect protocol: the request and each
+    /// response message are framed as [flags (1 byte)][length (4 bytes, big-endian)][JSON]. A frame with flag 0x02 ends the
+    /// stream and may carry an error.
+    /// </summary>
+    public async Task<IReadOnlyList<RoomTimeSeriesRow>> GetRoomTimeSeriesAsync(
+        string deviceName, string roomId, DateTimeOffset start, DateTimeOffset end, int bucketMinutes, CancellationToken cancellationToken)
+    {
+        const string method = "GetSentioRoomTimeSeries";
+        var json = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            deviceName,
+            roomId,
+            startTime = start.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture),
+            endTime = end.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture),
+            bucketIntervalMinutes = bucketMinutes.ToString(CultureInfo.InvariantCulture),
+        });
+
+        var body = new byte[5 + json.Length];
+        BinaryPrimitives.WriteInt32BigEndian(body.AsSpan(1, 4), json.Length);
+        json.CopyTo(body, 5);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, ServicePath + method) { Content = new ByteArrayContent(body) };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/connect+json");
+        request.Headers.Add("Connect-Protocol-Version", "1");
+
+        using var response = await httpClient.SendAsync(request, cancellationToken);
+        var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException(
+                $"Wavin {method} failed with {(int)response.StatusCode}: {Encoding.UTF8.GetString(bytes)}", null, response.StatusCode);
+        }
+
+        var rows = new List<RoomTimeSeriesRow>();
+        var i = 0;
+        while (i + 5 <= bytes.Length)
+        {
+            var flags = bytes[i];
+            var length = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(i + 1, 4));
+            var frame = bytes.AsSpan(i + 5, length);
+            i += 5 + length;
+
+            if ((flags & 0x02) != 0)
+            {
+                using var endOfStream = JsonDocument.Parse(frame.ToArray());
+                if (endOfStream.RootElement.TryGetProperty("error", out var error))
+                {
+                    throw new HttpRequestException($"Wavin {method} failed: {error.GetRawText()}");
+                }
+
+                break;
+            }
+
+            rows.Add(JsonSerializer.Deserialize<RoomTimeSeriesRow>(frame, JsonSerializerOptions.Web)
+                ?? throw new InvalidOperationException($"Wavin {method} returned an empty row."));
+        }
+
+        return rows;
     }
 
     private async Task<T> PostAsync<T>(string method, object body, CancellationToken cancellationToken)
