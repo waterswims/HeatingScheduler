@@ -42,13 +42,20 @@ public sealed record RatioRules(double OnToOffRatio, int MinOnSlots, int MaxOffS
         : history.OffSlots < MaxOffSlots;
 }
 
-public sealed record SolveResult(IReadOnlyList<bool> On, decimal Cost);
+/// <summary>
+/// <paramref name="Cost"/> is the sum of the prices of the "on" slots in the plan. <paramref name="OwedOnSlots"/> is the
+/// make-up heating still owed when the plan ends.
+/// </summary>
+public sealed record SolveResult(IReadOnlyList<bool> On, decimal Cost, int OwedOnSlots);
 
 /// <summary>
-/// Finds the on/off sequence with the lowest total price (sum of the prices of "on" slots) that obeys
-/// <see cref="RatioRules"/>, using dynamic programming over the half-hour slots. The result is exactly optimal.
-/// Ties are broken by fewest on/off switches. An on-block still owing make-up time when the horizon ends is
-/// allowed; the rolling re-plan deals with it once more prices are known.
+/// Finds the on/off sequence that obeys <see cref="RatioRules"/> with the lowest total price, using dynamic programming
+/// over the half-hour slots. The result is exactly optimal. Ties are broken by fewest on/off switches.
+/// <para>
+/// The total is the sum of the prices of the "on" slots, plus any make-up heating still owed when the plan ends,
+/// valued at the average price over the plan. Without that, every plan would end with the longest allowed off period,
+/// as if the heat lost then were free to put back.
+/// </para>
 /// </summary>
 public static class RatioScheduleSolver
 {
@@ -62,7 +69,7 @@ public static class RatioScheduleSolver
         var n = prices.Count;
         if (n == 0)
         {
-            return new SolveResult([], 0m);
+            return new SolveResult([], 0m, 0);
         }
 
         var start = history.IsOn
@@ -103,7 +110,12 @@ public static class RatioScheduleSolver
             layers.Add(next);
         }
 
-        var (bestState, best) = layers[n].Aggregate((a, b) => IsBetter(b.Value, a.Value) ? b : a);
+        // Choose the end state including the value of make-up heating still owed (depends only on the end state,
+        // so the comparison by in-plan cost above stays exact).
+        var averagePrice = prices.Average();
+        var (bestState, best) = layers[n]
+            .Select(kv => (State: kv.Key, Node: kv.Value with { Cost = kv.Value.Cost + Owed(kv.Key, rules) * averagePrice }))
+            .Aggregate((a, b) => IsBetter(b.Node, a.Node) ? b : a);
 
         var result = new bool[n];
         var current = bestState;
@@ -114,8 +126,12 @@ public static class RatioScheduleSolver
             current = node.Previous;
         }
 
-        return new SolveResult(result, best.Cost);
+        return new SolveResult(result, layers[n][bestState].Cost, Owed(bestState, rules));
     }
+
+    /// <summary>Make-up on-slots still owed in <paramref name="state"/>: the rest of the current on-block, or all of it after an off period.</summary>
+    private static int Owed(State state, RatioRules rules) =>
+        state.IsOn ? state.N : rules.RequiredOnSlotsAfter(state.N);
 
     private static bool IsBetter(Node a, Node b) =>
         a.Cost < b.Cost || (a.Cost == b.Cost && a.Switches < b.Switches);

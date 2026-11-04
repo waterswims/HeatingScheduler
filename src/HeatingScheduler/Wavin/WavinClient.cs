@@ -99,10 +99,27 @@ public sealed class WavinClient(HttpClient httpClient, TimeProvider timeProvider
 
         var rows = new List<RoomTimeSeriesRow>();
         var i = 0;
-        while (i + 5 <= bytes.Length)
+        while (i < bytes.Length)
         {
+            if (i + 5 > bytes.Length)
+            {
+                throw new HttpRequestException($"Wavin {method} returned a truncated stream (incomplete frame header).");
+            }
+
             var flags = bytes[i];
             var length = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(i + 1, 4));
+            if (length < 0 || length > bytes.Length - i - 5)
+            {
+                throw new HttpRequestException(
+                    $"Wavin {method} returned a truncated stream (frame of {length} bytes, {bytes.Length - i - 5} available).");
+            }
+
+            if ((flags & 0x01) != 0)
+            {
+                // Compression is only used when the client offers it (Connect-Accept-Encoding), which this client doesn't.
+                throw new HttpRequestException($"Wavin {method} returned a compressed frame, which is not supported.");
+            }
+
             var frame = bytes.AsSpan(i + 5, length);
             i += 5 + length;
 

@@ -16,7 +16,7 @@ public sealed record RoomEstimate(
     double? OffStartTemperature,
     double? CoolingPerHour,
     double? MaxOffMinutes,
-    TimeSpan? HeatingDuration,
+    int HeatingPeriods,
     double? HeatingPerHour,
     double? OnToOffRatio,
     string? Note);
@@ -32,8 +32,10 @@ public sealed record TuningResult(double? OnToOffRatio, int? MaxOffMinutes, IRea
 /// <item><b>Cooling:</b> the longest off period in the history; the cooling rate is the fitted (least-squares)
 /// temperature drop per minute over that period.</item>
 /// <item><b>Max off:</b> (temperature when that off period started − minimum temperature) ÷ cooling rate.</item>
-/// <item><b>Heating:</b> the on period after the most recent off period, from switch-on until the room reached
-/// the on temperature (or the on period ended, if it never did); the heating rate is the fitted rise per minute.</item>
+/// <item><b>Heating:</b> every finished on period that directly follows an off period, from switch-on until the room
+/// reached the on temperature (or the on period ended, if it never did). Each gives a fitted rise per minute, if it has
+/// at least <see cref="MinHeatingWindow"/> of data; the heating rate is the median of these. On periods still in
+/// progress are not used, because their early part is dominated by the floor's lag.</item>
 /// <item><b>Ratio:</b> cooling rate ÷ heating rate: the on time needed to put back the heat lost per minute off.</item>
 /// </list>
 /// Across rooms the shortest max off and the highest ratio are used, then kept within safety bounds.
@@ -55,8 +57,10 @@ public static class ThermalEstimator
     /// <summary>Rates below this (°C per minute, i.e. 0.03 °C/h) are treated as no measurable change.</summary>
     public const double MinRatePerMinute = 0.0005;
 
+    /// <summary>Shortest stretch of an on period that can be used to measure heating.</summary>
+    public static readonly TimeSpan MinHeatingWindow = TimeSpan.FromMinutes(60);
+
     private const double ReachedTolerance = 0.1;
-    private static readonly TimeSpan MinHeatingWindow = TimeSpan.FromMinutes(15);
 
     private sealed record Segment(HeatingState State, List<RoomReading> Readings, DateTimeOffset End, bool FollowsPrevious)
     {
@@ -95,7 +99,7 @@ public static class ThermalEstimator
 
         if (longestOff is null)
         {
-            return new RoomEstimate(room.Name, null, null, null, null, null, null, null,
+            return new RoomEstimate(room.Name, null, null, null, null, 0, null, null,
                 $"no off period of {MinOffPeriod.TotalMinutes:0} min or more yet");
         }
 
@@ -113,43 +117,41 @@ public static class ThermalEstimator
             maxOffMinutes = Math.Max(0, (startTemperature - settings.MinTemperature) / coolingPerMinute);
         }
 
-        // Heating: the on period after the most recent off period.
-        TimeSpan? heatingDuration = null;
+        // Heating: the median rate over finished on periods that directly follow an off period.
+        var rates = new List<double>();
+        for (var i = 1; i < segments.Count - 1; i++)
+        {
+            var (previous, on, next) = (segments[i - 1], segments[i], segments[i + 1]);
+            if (on.State != HeatingState.On || previous.State != HeatingState.Off || !on.FollowsPrevious || !next.FollowsPrevious)
+            {
+                continue;
+            }
+
+            var reached = on.Readings.FindIndex(r => r.AirTemperature >= settings.OnTemperature - ReachedTolerance);
+            var window = reached >= 0 ? on.Readings.Take(reached + 1).ToList() : on.Readings;
+            if (window.Count >= 2 && window[^1].At - window[0].At >= MinHeatingWindow)
+            {
+                rates.Add(SlopePerMinute(window));
+            }
+        }
+
         double? heatingPerHour = null;
         double? ratio = null;
-        var lastOn = Enumerable.Range(1, Math.Max(0, segments.Count - 1))
-            .Reverse()
-            .Select(i => (Off: segments[i - 1], On: segments[i]))
-            .FirstOrDefault(p => p.On.State == HeatingState.On && p.Off.State == HeatingState.Off && p.On.FollowsPrevious)
-            .On;
-
-        if (lastOn is null)
+        if (rates.Count == 0)
         {
-            note ??= "no on period after an off period yet";
+            note ??= $"no finished on period with {MinHeatingWindow.TotalMinutes:0} min or more of warming yet";
         }
         else
         {
-            var reached = lastOn.Readings.FindIndex(r => r.AirTemperature >= settings.OnTemperature - ReachedTolerance);
-            var window = reached >= 0 ? lastOn.Readings.Take(reached + 1).ToList() : lastOn.Readings;
-            var windowDuration = window[^1].At - window[0].At;
-            heatingDuration = windowDuration;
-
-            if (window.Count < 2 || windowDuration < MinHeatingWindow)
+            var heatingPerMinute = Median(rates);
+            heatingPerHour = heatingPerMinute * 60;
+            if (heatingPerMinute < MinRatePerMinute)
             {
-                note ??= reached == 0 ? "room was already at the on temperature" : "on period too short to measure heating";
+                note ??= "no measurable warming during on periods";
             }
-            else
+            else if (coolingPerMinute >= MinRatePerMinute)
             {
-                var heatingPerMinute = SlopePerMinute(window);
-                heatingPerHour = heatingPerMinute * 60;
-                if (heatingPerMinute < MinRatePerMinute)
-                {
-                    note ??= "no measurable warming during the last on period";
-                }
-                else if (coolingPerMinute >= MinRatePerMinute)
-                {
-                    ratio = coolingPerMinute / heatingPerMinute;
-                }
+                ratio = coolingPerMinute / heatingPerMinute;
             }
         }
 
@@ -159,7 +161,7 @@ public static class ThermalEstimator
             startTemperature,
             coolingPerMinute * 60,
             maxOffMinutes,
-            heatingDuration,
+            rates.Count,
             heatingPerHour,
             ratio,
             note);
@@ -196,6 +198,13 @@ public static class ThermalEstimator
         }
 
         return segments;
+    }
+
+    private static double Median(List<double> values)
+    {
+        var sorted = values.Order().ToList();
+        var mid = sorted.Count / 2;
+        return sorted.Count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
     }
 
     /// <summary>Least-squares slope of air temperature against time, in °C per minute.</summary>

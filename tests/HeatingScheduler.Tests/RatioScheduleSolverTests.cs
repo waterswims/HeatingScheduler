@@ -56,6 +56,48 @@ public class RatioScheduleSolverTests
     private static decimal Cost(IReadOnlyList<bool> on, IReadOnlyList<decimal> prices) =>
         on.Select((o, i) => o ? prices[i] : 0m).Sum();
 
+    /// <summary>
+    /// Make-up on-slots still owed at the end of <paramref name="on"/>, from the definition: the rest of an unfinished
+    /// on-block, or the whole make-up after a final off period.
+    /// </summary>
+    internal static int Owed(IReadOnlyList<bool> on, HeatingHistory history, double ratio, int minOn)
+    {
+        int Required(int offSlots) => Math.Max(minOn, (int)Math.Ceiling(ratio * offSlots - 1e-9));
+
+        var isOn = history.IsOn;
+        var onLen = history.OnSlots;
+        var offLen = history.OffSlots;
+        foreach (var slotOn in on)
+        {
+            if (slotOn)
+            {
+                if (!isOn)
+                {
+                    onLen = 0;
+                }
+
+                onLen++;
+                isOn = true;
+            }
+            else
+            {
+                if (isOn)
+                {
+                    offLen = 0;
+                }
+
+                offLen++;
+                isOn = false;
+            }
+        }
+
+        return isOn ? Math.Max(0, Required(offLen) - onLen) : Required(offLen);
+    }
+
+    /// <summary>The solver's objective: in-plan cost plus owed make-up valued at the average price.</summary>
+    private static decimal Objective(IReadOnlyList<bool> on, IReadOnlyList<decimal> prices, HeatingHistory history, double ratio, int minOn) =>
+        Cost(on, prices) + Owed(on, history, ratio, minOn) * prices.Average();
+
     public static TheoryData<double, int, int, bool, int, int> BruteForceCases()
     {
         var data = new TheoryData<double, int, int, bool, int, int>();
@@ -89,7 +131,7 @@ public class RatioScheduleSolverTests
                 var candidate = Enumerable.Range(0, n).Select(i => (mask >> i & 1) == 1).ToArray();
                 if (IsValid(candidate, history, ratio, minOn, maxOff))
                 {
-                    best = Math.Min(best, Cost(candidate, prices));
+                    best = Math.Min(best, Objective(candidate, prices, history, ratio, minOn));
                 }
             }
 
@@ -97,7 +139,8 @@ public class RatioScheduleSolverTests
 
             Assert.True(IsValid(result.On, history, ratio, minOn, maxOff), $"Invalid plan for prices [{string.Join(",", prices)}]");
             Assert.Equal(Cost(result.On, prices), result.Cost);
-            Assert.Equal(best, result.Cost);
+            Assert.Equal(Owed(result.On, history, ratio, minOn), result.OwedOnSlots);
+            Assert.Equal(best, Objective(result.On, prices, history, ratio, minOn));
         }
     }
 
@@ -105,10 +148,12 @@ public class RatioScheduleSolverTests
     public void Off_through_the_peak_then_makes_up_the_heat()
     {
         // Expensive peak for 4 slots, then cheap. Ratio 0.5: 4 slots off requires at least 2 on afterwards.
+        // Ending with 1 slot off then 1 on (50p) beats ending with 2 off and owing 1 slot at the average price (62.75p).
         decimal[] prices = [100, 100, 100, 100, 1, 1, 50, 50];
         var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(2), new RatioRules(0.5, 1, 4));
 
-        Assert.Equal([false, false, false, false, true, true, false, false], result.On);
+        Assert.Equal([false, false, false, false, true, true, false, true], result.On);
+        Assert.Equal(0, result.OwedOnSlots);
     }
 
     [Fact]
@@ -120,8 +165,9 @@ public class RatioScheduleSolverTests
         Assert.True(IsValid(result.On, HeatingHistory.On(2), 0.5, 1, 3));
         Assert.True(LongestRun(result.On, false) <= 3);
 
-        // 2 off + 1 on (⌈0.5 × 2⌉) is the most efficient block, ending with the maximum 3 off: 2+1+2+1+2+1+3 = 12.
-        Assert.Equal(300m, result.Cost);
+        // 2 off + 1 on (⌈0.5 × 2⌉) is the most efficient block. Ending on a long off period no longer looks free:
+        // the owed make-up is charged at the average price, so the best total is 4 on-slots' worth (400p).
+        Assert.Equal(400m, result.Cost + result.OwedOnSlots * 100m);
     }
 
     [Fact]
@@ -173,7 +219,21 @@ public class RatioScheduleSolverTests
         decimal[] prices = [100, 100, 100, 100];
         var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(1, afterOffSlots: 4), new RatioRules(0.75, 1, 4));
 
-        Assert.Equal([true, true, false, false], result.On);
+        Assert.True(result.On[0]);
+        Assert.True(result.On[1]);
+        Assert.True(IsValid(result.On, HeatingHistory.On(1, afterOffSlots: 4), 0.75, 1, 4));
+    }
+
+    [Fact]
+    public void Owed_make_up_at_end_of_plan_is_charged_at_average_price()
+    {
+        // Without the charge, staying off for the whole (short) plan would look free. With it, heating now in the
+        // cheap slots beats owing 2 slots at the average price.
+        decimal[] prices = [5, 5, 60, 60, 60, 60];
+        var result = RatioScheduleSolver.Solve(prices, HeatingHistory.On(2), new RatioRules(0.5, 2, 6));
+
+        Assert.True(result.On[0]);
+        Assert.True(result.On[1]);
     }
 
     [Fact]

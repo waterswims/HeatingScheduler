@@ -109,6 +109,17 @@ public class HeatingScheduleTests
     }
 
     [Fact]
+    public void Clock_stepping_back_before_first_decision_returns_latest_decision()
+    {
+        var schedule = Create();
+        schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 8, i => i == 0 ? 1m : 50m), T0);
+        var decision = schedule.GetDesiredState(T0.AddMinutes(1));
+
+        // E.g. an NTP correction steps the clock back across the slot boundary.
+        Assert.Equal(decision, schedule.GetDesiredState(T0.AddMinutes(-2)));
+    }
+
+    [Fact]
     public void PricesKnownUntil_stops_at_first_gap()
     {
         var schedule = Create();

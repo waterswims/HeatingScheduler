@@ -29,6 +29,9 @@ public sealed class ThermalTuningService(
     /// <summary>How often the rules are recalculated.</summary>
     public static readonly TimeSpan Interval = TimeSpan.FromMinutes(30);
 
+    /// <summary>A newly measured ratio is only applied when it differs from the current one by more than this fraction.</summary>
+    public const double RatioChangeThreshold = 0.1;
+
     private const double SetpointTolerance = 0.05;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -60,7 +63,10 @@ public sealed class ThermalTuningService(
 
         var result = ThermalEstimator.Estimate(history, settings);
         var current = schedule.Rules;
-        var ratio = result.OnToOffRatio ?? current.OnToOffRatio;
+        var ratio = result.OnToOffRatio is double measured
+            && Math.Abs(measured - current.OnToOffRatio) > RatioChangeThreshold * current.OnToOffRatio
+                ? measured
+                : current.OnToOffRatio;
         var maxOffSlots = result.MaxOffMinutes is int m ? Slots.FromMinutes(m) : current.MaxOffSlots;
 
         if (ratio.Equals(current.OnToOffRatio) && maxOffSlots == current.MaxOffSlots)
@@ -138,7 +144,8 @@ public sealed class ThermalTuningService(
 
         if (r.HeatingPerHour is { } h)
         {
-            parts.Add(string.Create(CultureInfo.InvariantCulture, $"heating {h:0.00}°C/h"));
+            parts.Add(string.Create(CultureInfo.InvariantCulture,
+                $"heating {h:0.00}°C/h (median of {r.HeatingPeriods} on period{(r.HeatingPeriods == 1 ? "" : "s")})"));
         }
 
         if (r.OnToOffRatio is { } ratio)

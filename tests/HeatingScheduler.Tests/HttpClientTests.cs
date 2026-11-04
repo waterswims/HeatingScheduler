@@ -158,6 +158,26 @@ public class WavinClientTests
         Assert.Equal("5", json.RootElement.GetProperty("bucketIntervalMinutes").GetString());
     }
 
+    [Theory]
+    [InlineData("truncated header")]
+    [InlineData("truncated frame")]
+    [InlineData("compressed")]
+    public async Task GetRoomTimeSeries_rejects_malformed_stream(string kind)
+    {
+        var good = Frame(0, """{"timestamp":"2026-11-03T17:00:00Z","airTemperature":22.6,"setpointTemperature":16}""");
+        var body = kind switch
+        {
+            "truncated header" => good.Concat(new byte[] { 0, 0, 0 }).ToArray(),
+            "truncated frame" => good[..^10],
+            _ => Frame(1, "{}"),
+        };
+        var (client, _, _) = Create((_, _) => new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(body) });
+
+        var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetRoomTimeSeriesAsync(
+            "devices/abc", "1", DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow, 5, CancellationToken.None));
+        Assert.Contains(kind == "compressed" ? "compressed" : "truncated", ex.Message);
+    }
+
     [Fact]
     public async Task GetRoomTimeSeries_throws_on_stream_error()
     {

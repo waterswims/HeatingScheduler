@@ -139,7 +139,11 @@ public sealed class HeatingSchedule : IHeatingSchedule
         lock (_lock)
         {
             CommitUpTo(utcNow);
-            return _committed[Slots.StartFor(utcNow)];
+
+            // If the clock stepped back to before the first decision, use the most recent decision.
+            return _committed.TryGetValue(Slots.StartFor(utcNow), out var decision)
+                ? decision
+                : _committed[_nextSlot!.Value - Slots.Length];
         }
     }
 
