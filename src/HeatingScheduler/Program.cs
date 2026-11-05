@@ -1,4 +1,5 @@
 using HeatingScheduler.Control;
+using HeatingScheduler.Notifications;
 using HeatingScheduler.Octopus;
 using HeatingScheduler.Options;
 using HeatingScheduler.Scheduling;
@@ -19,10 +20,14 @@ builder.Services.AddOptions<TuningOptions>().BindConfiguration(TuningOptions.Sec
             (tuning.MinTemperature > heating.Value.OffTemperature && tuning.MinTemperature < heating.Value.OnTemperature),
         "Tuning:MinTemperature must be between Heating:OffTemperature and Heating:OnTemperature.")
     .ValidateOnStart();
+builder.Services.AddOptions<EmailOptions>().BindConfiguration(EmailOptions.SectionName).ValidateDataAnnotations().ValidateOnStart();
 
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<HeatingSchedule>();
 builder.Services.AddSingleton<IHeatingSchedule>(sp => sp.GetRequiredService<HeatingSchedule>());
+builder.Services.AddSingleton<ThermalTuner>();
+builder.Services.AddSingleton<IEmailSender, SmtpEmailSender>();
+builder.Services.AddSingleton<PlanNotifier>();
 
 // Octopus Agile prices (public API, no auth).
 builder.Services
@@ -39,9 +44,5 @@ wavinHttp.AddHttpMessageHandler<WavinAuthHandler>(); // inner: fresh token on ev
 
 builder.Services.AddHostedService<PriceFetchService>();
 builder.Services.AddHostedService<HeatingControlService>();
-if (builder.Configuration.GetValue($"{TuningOptions.SectionName}:{nameof(TuningOptions.Enabled)}", true))
-{
-    builder.Services.AddHostedService<ThermalTuningService>();
-}
 
 builder.Build().Run();

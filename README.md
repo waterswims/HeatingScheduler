@@ -6,7 +6,7 @@ It runs two background services in one process:
 
 | Service | What it does |
 |---|---|
-| `PriceFetchService` | Every 30 minutes it fetches Agile prices for the next 24 hours (rolling), until prices are known for that whole period. Octopus publishes the next day's prices at about 16:00, so before then the horizon is shorter. |
+| `PriceFetchService` | Every 30 minutes it fetches all published Agile prices. Octopus publishes the next day's prices at about 16:00, so new prices arrive about once a day. When they do (and at startup) it re-tunes the rules from room temperatures, then emails the plan if it has changed. |
 | `HeatingControlService` | Just after every half-hour boundary, and at least every 5 minutes, it reads each room's setpoint from the Wavin Sentio cloud. Any room that doesn't match `OnTemperature` or `OffTemperature` for the current slot is set. |
 
 The two services share the schedule in memory.
@@ -18,22 +18,35 @@ The two services share the schedule in memory.
   - After an off period of length *F*, the heating must stay on for at least `OnToOffRatio` × *F* (rounded up to whole half-hours) to make up the heat lost. It may stay on longer.
   - Every on-block lasts at least `MinOnMinutes`.
   - For example, with a ratio of 0.5 and a 3-hour maximum, 2 hours off must be followed by at least 1 hour on.
-- **The solver:** finds the on/off pattern over the next 24 hours (or as far as prices are known) with the **lowest total price** that obeys the rule. It uses dynamic programming over the half-hour slots, so the result is exactly optimal, not an approximation. With positive prices it keeps the heating off through expensive periods and does the make-up heating in the cheapest slots. Any make-up heating still owed when the plan ends is charged at the plan's average price, so the plan doesn't treat a long final off period as free. When prices are negative, the heating comes on.
-- **Rolling horizon:** when each half-hour slot starts, the solver re-plans from what actually happened so far. That slot's decision is then fixed. The rest of the plan is re-optimised as time passes and new prices arrive, and the log shows the plan whenever it changes.
+- **The solver:** finds the on/off pattern over every known price (7–31 hours ahead, depending on the time of day) with the **lowest total price** that obeys the rule. It uses dynamic programming over the half-hour slots, so the result is exactly optimal, not an approximation. With positive prices it keeps the heating off through expensive periods and does the make-up heating in the cheapest slots. Any make-up heating still owed when the plan ends is charged at the plan's average price, so the plan doesn't treat a long final off period as free. When prices are negative, the heating comes on.
+- **Re-planning:** when each half-hour slot starts, the solver re-plans from what actually happened so far, and that slot's decision is then fixed. Because the plan always runs to the end of the known prices, it only changes when new prices arrive, when tuning changes the rules, or after a restart. The log shows the plan whenever it changes.
 - **After a restart:** the history is lost, so the solver assumes the heating has been on with no heat left to make up. It is free to switch off straight away, even if the heating had already been off for a while before the restart.
 
 ### Tuning from room temperatures
 
 The make-up ratio and maximum off period can be worked out from your rooms instead of fixed by hand. This is on by default (`Tuning:Enabled`).
 
-- **Readings:** the Sentio keeps months of room history (air and floor temperature, humidity and setpoint). The app reads the last 24 hours for each room it tunes against, at 5-minute resolution, using the same unofficial API call as the Wavin Sentio portal (`GetSentioRoomTimeSeries`). A reading counts as on or off when its setpoint is the on or off temperature; readings with any other setpoint (for example, set by hand) are left out. Nothing needs to be learnt after a restart.
-- **Recalculation:** at startup, then every 30 minutes, for each room:
-  - **Cooling rate:** the temperature drop per hour over the **longest finished** off period in the last 24 hours, fitted across all of its readings. Off periods shorter than an hour are ignored, and so is one still in progress, because its early part mostly shows heat still coming out of the floor.
-  - **Maximum off** = (temperature when that off period started − `Tuning:MinTemperature`) ÷ cooling rate.
-  - **Heating rate:** the median temperature rise per hour across every **finished** on period in the last 24 hours that directly followed an off period. Each one is measured from switch-on until the room reached the on temperature, or until the on period ended if it never got there, and needs at least an hour of readings. On periods still in progress aren't used, because their early part mostly shows the floor's lag.
+- **Readings:** the Sentio keeps months of room history (air and floor temperature, humidity and setpoint). The app reads the last 48 hours for each room it tunes against, at 5-minute resolution, using the same unofficial API call as the Wavin Sentio portal (`GetSentioRoomTimeSeries`). A reading counts as on or off when its setpoint is the on or off temperature; readings with any other setpoint (for example, set by hand) are left out. Nothing needs to be learnt after a restart.
+- **Recalculation:** whenever new prices arrive (about once a day) and at startup, for each room. If it fails, it is retried at the next price check (30 minutes later). Rates are measured between the temperature's **turning points** (peaks and troughs), not between switching times. With underfloor heating the air keeps falling for a while after the heating comes on, and keeps rising after it goes off; measuring from the turning points leaves that lag out.
+  - **Turning points:** the readings are smoothed with a 30-minute median, and a peak or trough is confirmed once the temperature has moved at least 0.2°C back from it. Rises or falls shorter than an hour (an oven, a shower, the sun) are removed, and the movement either side of them is merged.
+  - **Which rises and falls count:** a rise counts as heating if the heating was on for at least 70% of it, and a fall counts as cooling if the heating was on for at most 30% of it. Rises with the heating off (such as the sun) and movements with the heating mixed are left out, as is the movement still in progress.
+  - **Rates:** each rise or fall is measured with a straight-line fit through its readings. The **heating rate** and **cooling rate** are the medians.
+  - **Maximum off** = (median temperature at the start of the falls − `Tuning:MinTemperature`) ÷ cooling rate.
   - **Make-up ratio** = cooling rate ÷ heating rate.
 - **Combining rooms:** only the rooms in `Tuning:Rooms` are used, if set. Ideally pick a room whose temperature mostly reflects the heating. Among those rooms, the most demanding one decides, using the shortest maximum off and the highest ratio. The maximum off is rounded down to whole half-hours. Both values are kept within safety bounds (max off 60–720 minutes, ratio 0.05–3.0). A new ratio is only applied if it differs from the current one by more than 10%. The values then replace the `Schedule` values, and the plan is recalculated.
-- **When a value can't be measured,** the current value is kept. For example, a short on period may show no measurable warming because of underfloor lag. The values in `Schedule` are the starting point.
+- **When a value can't be measured,** the current value is kept. For example, there may be no finished rise with the heating on yet. The values in `Schedule` are the starting point.
+
+### Email notifications
+
+When `Email:Enabled` is true, the app emails the plan whenever it changes: new prices, a tuning change or a restart. Slots dropping off the front as time passes don't count as a change, so that's usually one email a day, at about 16:00. The email shows:
+
+- why the plan changed
+- the current slot's state
+- each on/off block with its times and average price
+- the rules in force, with their previous values when tuning changed them
+- what tuning measured for each room
+
+Mail is sent over SMTP. For Gmail, use `smtp.gmail.com`, port 587, your Gmail address as `Username`, and an [app password](https://myaccount.google.com/apppasswords) (not your normal password) as `Password`. Outbound port 25 is blocked on EC2, so use 587 or 465. If sending fails, it's retried at the next price check.
 
 > **Notes**
 > - The Wavin Sentio cloud API is **unofficial**. It is ported from the community library [djerik/wavinsentio](https://github.com/djerik/wavinsentio). Wavin could change it without notice.
@@ -56,6 +69,11 @@ The make-up ratio and maximum off period can be worked out from your rooms inste
 | `Wavin:Rooms` | `[]` | Room ids or names to control. When empty, every room is controlled. Unknown names are logged together with the list of available rooms. |
 | `Heating:OnTemperature` | `23.0` | Setpoint (°C) during on slots. |
 | `Heating:OffTemperature` | `16.0` | Setpoint (°C) during off slots. Must be below `OnTemperature`. |
+| `Email:Enabled` | `false` | Email the plan whenever it changes. |
+| `Email:To` | `[]` | Addresses that receive the emails. |
+| `Email:From` | `""` | Sender address. Defaults to `Email:Username`. |
+| `Email:SmtpHost` / `Email:SmtpPort` | `smtp.gmail.com` / `587` | SMTP server. Port 587 uses STARTTLS, 465 uses TLS. |
+| `Email:Username` / `Email:Password` | — | SMTP login. For Gmail, an app password. **Secret, so don't commit it.** |
 
 Rooms in Wavin vacation mode and devices that haven't been migrated to the current Wavin platform are skipped.
 

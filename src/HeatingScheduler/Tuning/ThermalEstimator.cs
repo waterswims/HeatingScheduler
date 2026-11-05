@@ -7,13 +7,13 @@ public sealed record RoomReading(DateTimeOffset At, double AirTemperature, Heati
 
 public sealed record RoomSeries(string Key, string Name, IReadOnlyList<RoomReading> Readings);
 
-public sealed record TuningSettings(double MinTemperature, double OnTemperature);
+public sealed record TuningSettings(double MinTemperature);
 
 /// <summary>What was measured for one room. Rates are in °C per hour; null means it could not be measured.</summary>
 public sealed record RoomEstimate(
     string Name,
-    TimeSpan? OffDuration,
-    double? OffStartTemperature,
+    int CoolingPeriods,
+    double? FallStartTemperature,
     double? CoolingPerHour,
     double? MaxOffMinutes,
     int HeatingPeriods,
@@ -27,24 +27,44 @@ public sealed record RoomEstimate(
 public sealed record TuningResult(double? OnToOffRatio, int? MaxOffMinutes, IReadOnlyList<RoomEstimate> Rooms);
 
 /// <summary>
-/// Works out the maximum off period and the make-up ratio from recorded room temperatures.
+/// Works out the maximum off period and the make-up ratio from recorded room temperatures, measuring between the
+/// temperature's turning points rather than between switching times. With underfloor heating the air temperature keeps
+/// falling for a while after the heating comes on (and rising after it goes off); measuring from the turning points
+/// leaves that lag out.
 /// <list type="number">
-/// <item><b>Cooling:</b> the longest finished off period in the history; the cooling rate is the fitted
-/// (least-squares) temperature drop per minute over that period. Off periods still in progress are not used: their
-/// early part mostly shows heat still coming out of the floor, which would understate cooling.</item>
-/// <item><b>Max off:</b> (temperature when that off period started − minimum temperature) ÷ cooling rate.</item>
-/// <item><b>Heating:</b> every finished on period that directly follows an off period, from switch-on until the room
-/// reached the on temperature (or the on period ended, if it never did). Each gives a fitted rise per minute, if it has
-/// at least <see cref="MinHeatingWindow"/> of data; the heating rate is the median of these. On periods still in
-/// progress are not used, because their early part is dominated by the floor's lag.</item>
+/// <item><b>Turning points:</b> the readings are smoothed (median over <see cref="SmoothingWindow"/>), then a peak or
+/// trough is confirmed once the temperature has moved at least <see cref="MinSwing"/> back from it. Rises or falls
+/// shorter than <see cref="MinLeg"/> (an oven, a shower, the sun through a window) are removed, merging the movement
+/// either side of them.</item>
+/// <item><b>Which movements count:</b> a rise counts as heating when the heating was on for at least
+/// <see cref="HeatingOnFraction"/> of it; a fall counts as cooling when the heating was on for at most
+/// <see cref="CoolingOnFraction"/> of it. Movements with the heating mixed, or with a gap in the readings, are left out.
+/// Only movements between two confirmed turning points are used, so the one in progress is never measured.</item>
+/// <item><b>Rates:</b> each rise or fall is measured by a straight-line (least-squares) fit through its raw readings;
+/// the smoothed readings are only used to find the turning points. The heating and cooling rates are the medians over
+/// the counted rises and falls.</item>
+/// <item><b>Max off:</b> (median temperature at the start of the falls, from the fitted lines − minimum temperature) ÷
+/// cooling rate.</item>
 /// <item><b>Ratio:</b> cooling rate ÷ heating rate: the on time needed to put back the heat lost per minute off.</item>
 /// </list>
 /// Across rooms the shortest max off and the highest ratio are used, then kept within safety bounds.
 /// </summary>
 public static class ThermalEstimator
 {
-    /// <summary>Off periods shorter than this are not used to measure cooling.</summary>
-    public static readonly TimeSpan MinOffPeriod = TimeSpan.FromMinutes(60);
+    /// <summary>Smallest movement between a peak and a trough that counts as a turning point (°C).</summary>
+    public const double MinSwing = 0.2;
+
+    /// <summary>Rises and falls shorter than this are treated as short disturbances and removed.</summary>
+    public static readonly TimeSpan MinLeg = TimeSpan.FromMinutes(60);
+
+    /// <summary>Width of the centred median used to smooth the readings.</summary>
+    public static readonly TimeSpan SmoothingWindow = TimeSpan.FromMinutes(30);
+
+    /// <summary>A rise counts as heating when the heating was on for at least this fraction of it.</summary>
+    public const double HeatingOnFraction = 0.7;
+
+    /// <summary>A fall counts as cooling when the heating was on for at most this fraction of it.</summary>
+    public const double CoolingOnFraction = 0.3;
 
     /// <summary>Range the maximum off period is kept within (minutes).</summary>
     public const int MaxOffLowerBoundMinutes = 60, MaxOffUpperBoundMinutes = 720;
@@ -58,16 +78,9 @@ public static class ThermalEstimator
     /// <summary>Rates below this (°C per minute, i.e. 0.03 °C/h) are treated as no measurable change.</summary>
     public const double MinRatePerMinute = 0.0005;
 
-    /// <summary>Shortest stretch of an on period that can be used to measure heating.</summary>
-    public static readonly TimeSpan MinHeatingWindow = TimeSpan.FromMinutes(60);
+    private readonly record struct TurningPoint(int Index, bool IsPeak);
 
-    private const double ReachedTolerance = 0.1;
-
-    private sealed record Segment(HeatingState State, List<RoomReading> Readings, DateTimeOffset End, bool FollowsPrevious)
-    {
-        public DateTimeOffset Start => Readings[0].At;
-        public TimeSpan Duration => End - Start;
-    }
+    private readonly record struct Leg(int From, int To, bool IsRise, double RatePerMinute, double StartTemperature, double OnFraction, bool HasGap);
 
     public static TuningResult Estimate(IReadOnlyList<RoomSeries> rooms, TuningSettings settings)
     {
@@ -92,65 +105,47 @@ public static class ThermalEstimator
 
     private static RoomEstimate EstimateRoom(RoomSeries room, TuningSettings settings)
     {
-        var segments = Split(room.Readings);
+        var readings = room.Readings;
+        var legs = Legs(readings).Where(l => !l.HasGap).ToList();
 
-        // Finished: directly followed by another period (so not still running, and not cut off by a gap).
-        var longestOff = segments
-            .Where((s, i) => s.State == HeatingState.Off && s.Duration >= MinOffPeriod && s.Readings.Count >= 2
-                && i + 1 < segments.Count && segments[i + 1].FollowsPrevious)
-            .MaxBy(s => s.Duration);
+        var falls = legs.Where(l => !l.IsRise && l.OnFraction <= CoolingOnFraction).ToList();
+        var rises = legs.Where(l => l.IsRise && l.OnFraction >= HeatingOnFraction).ToList();
 
-        if (longestOff is null)
-        {
-            return new RoomEstimate(room.Name, null, null, null, null, 0, null, null,
-                $"no finished off period of {MinOffPeriod.TotalMinutes:0} min or more yet");
-        }
-
-        var coolingPerMinute = -SlopePerMinute(longestOff.Readings);
-        var startTemperature = longestOff.Readings[0].AirTemperature;
-        double maxOffMinutes;
         string? note = null;
-        if (coolingPerMinute < MinRatePerMinute)
+        double? coolingPerHour = null, fallStart = null, maxOffMinutes = null, heatingPerHour = null, ratio = null;
+        var coolingPerMinute = 0.0;
+
+        if (falls.Count == 0)
         {
-            maxOffMinutes = double.PositiveInfinity;
-            note = "no measurable cooling";
+            note = $"no finished fall of {MinSwing}°C or more with the heating off yet";
         }
         else
         {
-            maxOffMinutes = Math.Max(0, (startTemperature - settings.MinTemperature) / coolingPerMinute);
-        }
-
-        // Heating: the median rate over finished on periods that directly follow an off period.
-        var rates = new List<double>();
-        for (var i = 1; i < segments.Count - 1; i++)
-        {
-            var (previous, on, next) = (segments[i - 1], segments[i], segments[i + 1]);
-            if (on.State != HeatingState.On || previous.State != HeatingState.Off || !on.FollowsPrevious || !next.FollowsPrevious)
+            coolingPerMinute = -Median(falls.Select(l => l.RatePerMinute));
+            coolingPerHour = coolingPerMinute * 60;
+            fallStart = Median(falls.Select(l => l.StartTemperature));
+            if (coolingPerMinute < MinRatePerMinute)
             {
-                continue;
+                maxOffMinutes = double.PositiveInfinity;
+                note = "no measurable cooling";
             }
-
-            var reached = on.Readings.FindIndex(r => r.AirTemperature >= settings.OnTemperature - ReachedTolerance);
-            var window = reached >= 0 ? on.Readings.Take(reached + 1).ToList() : on.Readings;
-            if (window.Count >= 2 && window[^1].At - window[0].At >= MinHeatingWindow)
+            else
             {
-                rates.Add(SlopePerMinute(window));
+                maxOffMinutes = Math.Max(0, (fallStart.Value - settings.MinTemperature) / coolingPerMinute);
             }
         }
 
-        double? heatingPerHour = null;
-        double? ratio = null;
-        if (rates.Count == 0)
+        if (rises.Count == 0)
         {
-            note ??= $"no finished on period with {MinHeatingWindow.TotalMinutes:0} min or more of warming yet";
+            note ??= $"no finished rise of {MinSwing}°C or more with the heating on yet";
         }
         else
         {
-            var heatingPerMinute = Median(rates);
+            var heatingPerMinute = Median(rises.Select(l => l.RatePerMinute));
             heatingPerHour = heatingPerMinute * 60;
             if (heatingPerMinute < MinRatePerMinute)
             {
-                note ??= "no measurable warming during on periods";
+                note ??= "no measurable warming";
             }
             else if (coolingPerMinute >= MinRatePerMinute)
             {
@@ -159,72 +154,242 @@ public static class ThermalEstimator
         }
 
         return new RoomEstimate(
-            room.Name,
-            longestOff.Duration,
-            startTemperature,
-            coolingPerMinute * 60,
-            maxOffMinutes,
-            rates.Count,
-            heatingPerHour,
-            ratio,
-            note);
+            room.Name, falls.Count, fallStart, coolingPerHour, maxOffMinutes, rises.Count, heatingPerHour, ratio, note);
     }
 
-    /// <summary>Splits readings into runs of the same heating state, also breaking at gaps longer than <see cref="MaxGap"/>.</summary>
-    private static List<Segment> Split(IReadOnlyList<RoomReading> readings)
+    /// <summary>The rises and falls between consecutive confirmed turning points of the smoothed readings.</summary>
+    private static List<Leg> Legs(IReadOnlyList<RoomReading> readings)
     {
-        var segments = new List<Segment>();
-        List<RoomReading>? current = null;
-        var follows = false;
-        for (var i = 0; i < readings.Count; i++)
-        {
-            var r = readings[i];
-            var gap = i > 0 && r.At - readings[i - 1].At > MaxGap;
-            if (current is null || r.State != current[0].State || gap)
-            {
-                if (current is not null)
-                {
-                    // A segment ends when the next one starts, unless there was a gap.
-                    segments.Add(new Segment(current[0].State, current, gap ? current[^1].At : r.At, follows));
-                }
+        var smoothed = Smooth(readings);
+        var points = Refine(readings, RemoveShortLegs(readings, smoothed, TurningPoints(smoothed)));
 
-                follows = current is not null && !gap;
-                current = [];
+        var legs = new List<Leg>();
+        for (var k = 0; k + 1 < points.Count; k++)
+        {
+            var (from, to) = (points[k].Index, points[k + 1].Index);
+            var minutes = (readings[to].At - readings[from].At).TotalMinutes;
+            if (minutes <= 0)
+            {
+                continue;
             }
 
-            current.Add(r);
+            var on = 0;
+            var gap = false;
+            for (var i = from; i <= to; i++)
+            {
+                on += readings[i].State == HeatingState.On ? 1 : 0;
+                gap |= i > from && readings[i].At - readings[i - 1].At > MaxGap;
+            }
+
+            var (slope, start) = FitLine(readings, from, to);
+            legs.Add(new Leg(
+                from, to,
+                IsRise: !points[k].IsPeak,
+                RatePerMinute: slope,
+                StartTemperature: start,
+                OnFraction: (double)on / (to - from + 1),
+                HasGap: gap));
         }
 
-        if (current is not null)
-        {
-            segments.Add(new Segment(current[0].State, current, current[^1].At, follows));
-        }
-
-        return segments;
+        return legs;
     }
 
-    private static double Median(List<double> values)
+    /// <summary>Centred median over <see cref="SmoothingWindow"/>, which removes single-reading noise.</summary>
+    private static double[] Smooth(IReadOnlyList<RoomReading> readings)
+    {
+        var half = SmoothingWindow / 2;
+        var result = new double[readings.Count];
+        for (var i = 0; i < readings.Count; i++)
+        {
+            var window = new List<double>();
+            for (var j = i; j >= 0 && readings[i].At - readings[j].At <= half; j--)
+            {
+                window.Add(readings[j].AirTemperature);
+            }
+
+            for (var j = i + 1; j < readings.Count && readings[j].At - readings[i].At <= half; j++)
+            {
+                window.Add(readings[j].AirTemperature);
+            }
+
+            result[i] = Median(window);
+        }
+
+        return result;
+    }
+
+    /// <summary>Peaks and troughs, each confirmed by the temperature moving at least <see cref="MinSwing"/> back from it.</summary>
+    private static List<TurningPoint> TurningPoints(double[] t)
+    {
+        var points = new List<TurningPoint>();
+        if (t.Length == 0)
+        {
+            return points;
+        }
+
+        bool? rising = null;
+        int low = 0, high = 0;   // running extremes until the first direction is known
+        var candidate = 0;
+        for (var i = 1; i < t.Length; i++)
+        {
+            switch (rising)
+            {
+                case null:
+                    if (t[i] < t[low]) low = i;
+                    if (t[i] > t[high]) high = i;
+                    if (t[i] >= t[low] + MinSwing)
+                    {
+                        points.Add(new TurningPoint(low, IsPeak: false));
+                        (rising, candidate) = (true, i);
+                    }
+                    else if (t[i] <= t[high] - MinSwing)
+                    {
+                        points.Add(new TurningPoint(high, IsPeak: true));
+                        (rising, candidate) = (false, i);
+                    }
+
+                    break;
+
+                case true:
+                    if (t[i] > t[candidate])
+                    {
+                        candidate = i;
+                    }
+                    else if (t[i] <= t[candidate] - MinSwing)
+                    {
+                        points.Add(new TurningPoint(candidate, IsPeak: true));
+                        (rising, candidate) = (false, i);
+                    }
+
+                    break;
+
+                case false:
+                    if (t[i] < t[candidate])
+                    {
+                        candidate = i;
+                    }
+                    else if (t[i] >= t[candidate] + MinSwing)
+                    {
+                        points.Add(new TurningPoint(candidate, IsPeak: false));
+                        (rising, candidate) = (true, i);
+                    }
+
+                    break;
+            }
+        }
+
+        return points;
+    }
+
+    /// <summary>
+    /// Repeatedly removes the shortest rise or fall while it is shorter than <see cref="MinLeg"/>. Its far end is
+    /// dropped together with the less extreme of the two turning points of the same kind either side, so a short
+    /// disturbance in the middle of a long fall (or rise) merges into it and the true peak or trough is kept.
+    /// </summary>
+    private static List<TurningPoint> RemoveShortLegs(IReadOnlyList<RoomReading> readings, double[] t, List<TurningPoint> points)
+    {
+        while (points.Count >= 2)
+        {
+            var shortest = -1;
+            var shortestLength = MinLeg;
+            for (var k = 0; k + 1 < points.Count; k++)
+            {
+                var length = readings[points[k + 1].Index].At - readings[points[k].Index].At;
+                if (length < shortestLength)
+                {
+                    (shortest, shortestLength) = (k, length);
+                }
+            }
+
+            if (shortest < 0)
+            {
+                break;
+            }
+
+            if (shortest + 2 >= points.Count)
+            {
+                points.RemoveAt(shortest + 1);
+                continue;
+            }
+
+            var (a, c) = (points[shortest], points[shortest + 2]);
+            var keepA = a.IsPeak ? t[a.Index] >= t[c.Index] : t[a.Index] <= t[c.Index];
+            if (keepA)
+            {
+                points.RemoveRange(shortest + 1, 2);
+            }
+            else
+            {
+                points.RemoveRange(shortest, 2);
+            }
+        }
+
+        return points;
+    }
+
+    /// <summary>
+    /// Moves each turning point to the highest (peak) or lowest (trough) raw reading within half the smoothing window,
+    /// since smoothing can shift where a peak or trough appears when the rise and fall rates differ.
+    /// </summary>
+    private static List<TurningPoint> Refine(IReadOnlyList<RoomReading> readings, List<TurningPoint> points)
+    {
+        var half = SmoothingWindow / 2;
+        var refined = new List<TurningPoint>(points.Count);
+        for (var k = 0; k < points.Count; k++)
+        {
+            var p = points[k];
+            var lowerLimit = k > 0 ? refined[k - 1].Index + 1 : 0;
+            var upperLimit = k + 1 < points.Count ? points[k + 1].Index - 1 : readings.Count - 1;
+            var best = p.Index;
+            for (var i = p.Index; i >= lowerLimit && readings[p.Index].At - readings[i].At <= half; i--)
+            {
+                best = Better(i, best);
+            }
+
+            for (var i = p.Index + 1; i <= upperLimit && readings[i].At - readings[p.Index].At <= half; i++)
+            {
+                best = Better(i, best);
+            }
+
+            refined.Add(p with { Index = best });
+
+            int Better(int i, int current) =>
+                p.IsPeak ? (readings[i].AirTemperature > readings[current].AirTemperature ? i : current)
+                         : (readings[i].AirTemperature < readings[current].AirTemperature ? i : current);
+        }
+
+        return refined;
+    }
+
+    /// <summary>Least-squares line through readings[from..to]: slope in °C per minute and the fitted value at the first reading.</summary>
+    private static (double SlopePerMinute, double Start) FitLine(IReadOnlyList<RoomReading> readings, int from, int to)
+    {
+        var t0 = readings[from].At;
+        var n = to - from + 1;
+        double sx = 0, sy = 0;
+        for (var i = from; i <= to; i++)
+        {
+            sx += (readings[i].At - t0).TotalMinutes;
+            sy += readings[i].AirTemperature;
+        }
+
+        var (xMean, yMean) = (sx / n, sy / n);
+        double sxx = 0, sxy = 0;
+        for (var i = from; i <= to; i++)
+        {
+            var dx = (readings[i].At - t0).TotalMinutes - xMean;
+            sxx += dx * dx;
+            sxy += dx * (readings[i].AirTemperature - yMean);
+        }
+
+        var slope = sxx == 0 ? 0 : sxy / sxx;
+        return (slope, yMean - slope * xMean);
+    }
+
+    private static double Median(IEnumerable<double> values)
     {
         var sorted = values.Order().ToList();
         var mid = sorted.Count / 2;
         return sorted.Count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-    }
-
-    /// <summary>Least-squares slope of air temperature against time, in °C per minute.</summary>
-    private static double SlopePerMinute(IReadOnlyList<RoomReading> readings)
-    {
-        var t0 = readings[0].At;
-        var xs = readings.Select(r => (r.At - t0).TotalMinutes).ToList();
-        var ys = readings.Select(r => r.AirTemperature).ToList();
-        var xMean = xs.Average();
-        var yMean = ys.Average();
-        var sxx = xs.Sum(x => (x - xMean) * (x - xMean));
-        if (sxx == 0)
-        {
-            return 0;
-        }
-
-        var sxy = xs.Zip(ys).Sum(p => (p.First - xMean) * (p.Second - yMean));
-        return sxy / sxx;
     }
 }

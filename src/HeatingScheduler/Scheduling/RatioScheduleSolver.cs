@@ -53,8 +53,8 @@ public sealed record SolveResult(IReadOnlyList<bool> On, decimal Cost, int OwedO
 /// over the half-hour slots. The result is exactly optimal. Ties are broken by fewest on/off switches.
 /// <para>
 /// The total is the sum of the prices of the "on" slots, plus any make-up heating still owed when the plan ends,
-/// valued at the average price over the plan. Without that, every plan would end with the longest allowed off period,
-/// as if the heat lost then were free to put back.
+/// valued at <c>owedSlotPrice</c> per slot (by default the average price over the plan). Without that, every plan would
+/// end with the longest allowed off period, as if the heat lost then were free to put back.
 /// </para>
 /// </summary>
 public static class RatioScheduleSolver
@@ -64,7 +64,7 @@ public static class RatioScheduleSolver
 
     private readonly record struct Node(decimal Cost, int Switches, State Previous, bool On);
 
-    public static SolveResult Solve(IReadOnlyList<decimal> prices, HeatingHistory history, RatioRules rules)
+    public static SolveResult Solve(IReadOnlyList<decimal> prices, HeatingHistory history, RatioRules rules, decimal? owedSlotPrice = null)
     {
         var n = prices.Count;
         if (n == 0)
@@ -112,7 +112,7 @@ public static class RatioScheduleSolver
 
         // Choose the end state including the value of make-up heating still owed (depends only on the end state,
         // so the comparison by in-plan cost above stays exact).
-        var averagePrice = prices.Average();
+        var averagePrice = owedSlotPrice ?? prices.Average();
         var (bestState, best) = layers[n]
             .Select(kv => (State: kv.Key, Node: kv.Value with { Cost = kv.Value.Cost + Owed(kv.Key, rules) * averagePrice }))
             .Aggregate((a, b) => IsBetter(b.Node, a.Node) ? b : a);

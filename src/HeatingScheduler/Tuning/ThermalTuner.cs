@@ -7,59 +7,39 @@ using Microsoft.Extensions.Options;
 namespace HeatingScheduler.Tuning;
 
 /// <summary>
-/// Periodically works out the make-up ratio and maximum off period from the Sentio's room temperature history
-/// (see <see cref="ThermalEstimator"/>) and applies them to the <see cref="HeatingSchedule"/>.
+/// Works out the make-up ratio and maximum off period from the Sentio's room temperature history
+/// (see <see cref="ThermalEstimator"/>) and applies them to the <see cref="HeatingSchedule"/>. Run by
+/// <see cref="PriceFetchService"/> whenever new prices arrive, so the plan is re-tuned once a day.
 /// When a value can't be measured, the current one (initially from <see cref="ScheduleOptions"/>) stays in force.
 /// </summary>
-public sealed class ThermalTuningService(
+public sealed class ThermalTuner(
     IWavinClient wavin,
     HeatingSchedule schedule,
     IOptions<TuningOptions> tuningOptions,
     IOptions<WavinOptions> wavinOptions,
     IOptions<HeatingOptions> heatingOptions,
     TimeProvider timeProvider,
-    ILogger<ThermalTuningService> logger) : BackgroundService
+    ILogger<ThermalTuner> logger)
 {
     /// <summary>Bucket size requested from the Sentio history.</summary>
     public const int BucketMinutes = 5;
 
-    /// <summary>How much room history is analysed.</summary>
-    public static readonly TimeSpan History = TimeSpan.FromHours(24);
-
-    /// <summary>How often the rules are recalculated.</summary>
-    public static readonly TimeSpan Interval = TimeSpan.FromMinutes(30);
+    /// <summary>How much room history is analysed: enough for several heating cycles.</summary>
+    public static readonly TimeSpan History = TimeSpan.FromHours(48);
 
     /// <summary>A newly measured ratio is only applied when it differs from the current one by more than this fraction.</summary>
     public const double RatioChangeThreshold = 0.1;
 
     private const double SetpointTolerance = 0.05;
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        using var timer = new PeriodicTimer(Interval, timeProvider);
-        do
-        {
-            try
-            {
-                await RunOnceAsync(stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Failed to work out heating rules from room temperatures; will retry");
-            }
-        }
-        while (await timer.WaitForNextTickAsync(stoppingToken));
-    }
+    public bool Enabled => tuningOptions.Value.Enabled;
 
+    /// <summary>Fetches the room history, works out the rules and applies any change to the schedule.</summary>
     public async Task<TuningResult> RunOnceAsync(CancellationToken cancellationToken)
     {
         var history = await FetchHistoryAsync(cancellationToken);
 
-        var settings = new TuningSettings(tuningOptions.Value.MinTemperature, heatingOptions.Value.OnTemperature);
+        var settings = new TuningSettings(tuningOptions.Value.MinTemperature);
 
         var result = ThermalEstimator.Estimate(history, settings);
         var current = schedule.Rules;
@@ -130,13 +110,16 @@ public sealed class ThermalTuningService(
         : Math.Abs(setpoint - heating.OffTemperature) <= SetpointTolerance ? HeatingState.Off
         : null;
 
-    private static string Describe(IReadOnlyList<RoomEstimate> rooms) => string.Join("; ", rooms.Select(r =>
+    private static string Describe(IReadOnlyList<RoomEstimate> rooms) => string.Join("; ", rooms.Select(DescribeRoom));
+
+    /// <summary>One line describing what was measured for a room.</summary>
+    public static string DescribeRoom(RoomEstimate r)
     {
         var parts = new List<string>();
         if (r.CoolingPerHour is { } c)
         {
             parts.Add(string.Create(CultureInfo.InvariantCulture,
-                $"cooling {c:0.00}°C/h over {r.OffDuration!.Value.TotalHours:0.#}h off from {r.OffStartTemperature:0.0}°C"));
+                $"cooling {c:0.00}°C/h (median of {r.CoolingPeriods} fall{(r.CoolingPeriods == 1 ? "" : "s")}, from {r.FallStartTemperature:0.0}°C)"));
             parts.Add(r.MaxOffMinutes is { } mo && double.IsFinite(mo)
                 ? string.Create(CultureInfo.InvariantCulture, $"max off {mo:0} min")
                 : "max off unlimited");
@@ -145,7 +128,7 @@ public sealed class ThermalTuningService(
         if (r.HeatingPerHour is { } h)
         {
             parts.Add(string.Create(CultureInfo.InvariantCulture,
-                $"heating {h:0.00}°C/h (median of {r.HeatingPeriods} on period{(r.HeatingPeriods == 1 ? "" : "s")})"));
+                $"heating {h:0.00}°C/h (median of {r.HeatingPeriods} rise{(r.HeatingPeriods == 1 ? "" : "s")})"));
         }
 
         if (r.OnToOffRatio is { } ratio)
@@ -159,5 +142,5 @@ public sealed class ThermalTuningService(
         }
 
         return $"{r.Name}: {string.Join(", ", parts)}";
-    }));
+    }
 }

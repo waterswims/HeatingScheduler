@@ -1,6 +1,9 @@
+using HeatingScheduler.Notifications;
 using HeatingScheduler.Octopus;
 using HeatingScheduler.Options;
 using HeatingScheduler.Scheduling;
+using HeatingScheduler.Tuning;
+using HeatingScheduler.Wavin;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
 
@@ -119,6 +122,30 @@ public class HeatingScheduleTests
         Assert.Equal(decision, schedule.GetDesiredState(T0.AddMinutes(-2)));
     }
 
+    [Theory]
+    [InlineData(1.0, 600)]
+    [InlineData(0.5, 300)]
+    [InlineData(1.5, 360)]
+    public void Plan_does_not_change_as_slots_pass_without_new_prices(double ratio, int maxOffMinutes)
+    {
+        // Re-planning from each new slot (with the actual history) must give the same plan, otherwise the plan
+        // would change, and an email be sent, every half hour.
+        for (var seed = 0; seed < 30; seed++)
+        {
+            var random = new Random(seed);
+            var schedule = Create(ratio: ratio, maxOffMinutes: maxOffMinutes, minOnMinutes: 60);
+            schedule.UpdatePrices(TestHelpers.SlotsFrom(T0, 40, _ => random.Next(15, 70)), T0);
+            schedule.GetDesiredState(T0);
+            var initial = schedule.Plan.ToDictionary(p => p.Start, p => p.State);
+
+            for (var i = 1; i < 39; i++)
+            {
+                schedule.GetDesiredState(T0 + i * Slots.Length);
+                Assert.All(schedule.Plan, p => Assert.Equal(initial[p.Start], p.State));
+            }
+        }
+    }
+
     [Fact]
     public void PricesKnownUntil_stops_at_first_gap()
     {
@@ -147,61 +174,148 @@ public class PriceFetchServiceTests
 {
     private sealed class FakeOctopus(List<AgileSlot> available) : IOctopusAgileClient
     {
+        public List<AgileSlot> Available { get; } = available;
         public List<(DateTimeOffset From, DateTimeOffset To)> Calls { get; } = [];
 
         public Task<IReadOnlyList<AgileSlot>> GetRatesAsync(DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken cancellationToken)
         {
             Calls.Add((fromUtc, toUtc));
             return Task.FromResult<IReadOnlyList<AgileSlot>>(
-                available.Where(s => s.ValidFrom >= fromUtc && s.ValidFrom < toUtc).ToList());
+                Available.Where(s => s.ValidFrom >= fromUtc && s.ValidFrom < toUtc).ToList());
+        }
+    }
+
+    /// <summary>Wavin fake for tuning: one room with no usable history, so tuning runs but changes nothing.</summary>
+    private sealed class FakeWavin : IWavinClient
+    {
+        public int HistoryCalls { get; private set; }
+        public int FailuresLeft { get; set; }
+
+        private static WavinDevice Device => new()
+        {
+            Name = "devices/1",
+            LastConfig = new WavinLastConfig
+            {
+                Sentio = new WavinSentioConfig { Rooms = [new WavinRoom { Id = System.Text.Json.JsonSerializer.SerializeToElement("1"), Title = "Lobby" }] },
+            },
+        };
+
+        public Task<IReadOnlyList<WavinDevice>> ListDevicesAsync(CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<WavinDevice>>([Device]);
+
+        public Task<WavinDevice> GetDeviceAsync(string deviceName, CancellationToken cancellationToken) => Task.FromResult(Device);
+
+        public Task SetRoomSetpointsAsync(string deviceName, IReadOnlyList<RoomSetpoint> setpoints, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<RoomTimeSeriesRow>> GetRoomTimeSeriesAsync(
+            string deviceName, string roomId, DateTimeOffset start, DateTimeOffset end, int bucketMinutes, CancellationToken cancellationToken)
+        {
+            HistoryCalls++;
+            if (FailuresLeft > 0)
+            {
+                FailuresLeft--;
+                throw new HttpRequestException("Wavin unavailable");
+            }
+
+            return Task.FromResult<IReadOnlyList<RoomTimeSeriesRow>>([]);
+        }
+    }
+
+    private sealed class FakeEmail : IEmailSender
+    {
+        public List<(string Subject, string Body)> Sent { get; } = [];
+
+        public Task SendAsync(string subject, string body, CancellationToken cancellationToken)
+        {
+            Sent.Add((subject, body));
+            return Task.CompletedTask;
         }
     }
 
     private static readonly DateTimeOffset Slot = DateTimeOffset.Parse("2026-11-04T12:00:00Z");
 
-    private static (PriceFetchService Service, HeatingSchedule Schedule) Create(FakeOctopus octopus, DateTimeOffset now)
+    private sealed record Rig(PriceFetchService Service, HeatingSchedule Schedule, FakeOctopus Octopus, FakeWavin Wavin, FakeEmail Email, FakeTimeProvider Time);
+
+    private static Rig Create(int slots, DateTimeOffset? now = null)
     {
+        var octopus = new FakeOctopus(TestHelpers.SlotsFrom(Slot, slots, i => 10 + i % 7));
         var schedule = new HeatingSchedule(TestHelpers.Opt(new ScheduleOptions()), NullLogger<HeatingSchedule>.Instance);
-        var service = new PriceFetchService(
-            octopus, schedule,
-            new FakeTimeProvider(now),
-            NullLogger<PriceFetchService>.Instance);
-        return (service, schedule);
+        var wavin = new FakeWavin();
+        var email = new FakeEmail();
+        var time = new FakeTimeProvider(now ?? Slot.AddMinutes(10));
+        var heating = TestHelpers.Opt(new HeatingOptions { OnTemperature = 23, OffTemperature = 16 });
+        var tuner = new ThermalTuner(
+            wavin, schedule,
+            TestHelpers.Opt(new TuningOptions { MinTemperature = 21 }),
+            TestHelpers.Opt(new WavinOptions()),
+            heating, time, NullLogger<ThermalTuner>.Instance);
+        var notifier = new PlanNotifier(
+            email,
+            TestHelpers.Opt(new EmailOptions { Enabled = true, To = ["me@example.com"], SmtpHost = "smtp.example.com", From = "app@example.com" }),
+            heating, NullLogger<PlanNotifier>.Instance);
+        var service = new PriceFetchService(octopus, schedule, tuner, notifier, time, NullLogger<PriceFetchService>.Instance);
+        return new Rig(service, schedule, octopus, wavin, email, time);
     }
 
     [Fact]
-    public async Task Fetches_rolling_horizon_from_current_slot()
+    public async Task Fetches_all_published_prices_and_plans_to_their_end()
     {
-        var octopus = new FakeOctopus(TestHelpers.SlotsFrom(Slot, 20, i => i));
-        var (service, schedule) = Create(octopus, Slot.AddMinutes(10));
+        // 30 hours of prices: the plan covers all of them, not just 24 hours.
+        var rig = Create(60);
 
-        await service.RunOnceAsync(CancellationToken.None);
+        await rig.Service.RunOnceAsync(CancellationToken.None);
 
-        Assert.Equal((Slot, Slot.AddHours(24)), Assert.Single(octopus.Calls));
-        Assert.Equal(Slot + 20 * Slots.Length, schedule.PricesKnownUntil(Slot));
+        Assert.Equal((Slot, Slot + HeatingSchedule.MaxHorizon), Assert.Single(rig.Octopus.Calls));
+        Assert.Equal(Slot + 60 * Slots.Length, rig.Schedule.PricesKnownUntil(Slot));
+        Assert.Equal(59, rig.Schedule.Plan.Count);
     }
 
     [Fact]
-    public async Task Skips_fetch_when_whole_horizon_is_known()
+    public async Task Tunes_only_when_new_prices_arrive()
     {
-        var octopus = new FakeOctopus(TestHelpers.SlotsFrom(Slot, 60, i => i));
-        var (service, _) = Create(octopus, Slot);
+        var rig = Create(20);
 
-        await service.RunOnceAsync(CancellationToken.None);
-        await service.RunOnceAsync(CancellationToken.None);
+        await rig.Service.RunOnceAsync(CancellationToken.None);   // startup: new prices → tune
+        await rig.Service.RunOnceAsync(CancellationToken.None);   // nothing new
+        Assert.Equal(1, rig.Wavin.HistoryCalls);
 
-        Assert.Single(octopus.Calls);
+        rig.Octopus.Available.AddRange(TestHelpers.SlotsFrom(Slot + 20 * Slots.Length, 10, _ => 5m));
+        await rig.Service.RunOnceAsync(CancellationToken.None);   // new prices → tune again
+        Assert.Equal(2, rig.Wavin.HistoryCalls);
     }
 
     [Fact]
-    public async Task Fetches_again_while_horizon_is_incomplete()
+    public async Task Retries_tuning_at_next_check_after_failure()
     {
-        var octopus = new FakeOctopus(TestHelpers.SlotsFrom(Slot, 20, i => i));
-        var (service, _) = Create(octopus, Slot);
+        var rig = Create(20);
+        rig.Wavin.FailuresLeft = 1;
 
-        await service.RunOnceAsync(CancellationToken.None);
-        await service.RunOnceAsync(CancellationToken.None);
+        await rig.Service.RunOnceAsync(CancellationToken.None);   // tuning fails
+        await rig.Service.RunOnceAsync(CancellationToken.None);   // no new prices, but tuning still due
+        await rig.Service.RunOnceAsync(CancellationToken.None);   // done
 
-        Assert.Equal(2, octopus.Calls.Count);
+        Assert.Equal(2, rig.Wavin.HistoryCalls);
+    }
+
+    [Fact]
+    public async Task Emails_when_the_plan_changes_and_not_otherwise()
+    {
+        var rig = Create(20);
+
+        await rig.Service.RunOnceAsync(CancellationToken.None);
+        var (subject, body) = Assert.Single(rig.Email.Sent);
+        Assert.StartsWith("Heating plan: on ", subject);
+        Assert.Contains("new Agile prices until", body);
+
+        // Half an hour later with no new prices: the plan is the same, so no email.
+        rig.Time.Advance(TimeSpan.FromMinutes(30));
+        await rig.Service.RunOnceAsync(CancellationToken.None);
+        Assert.Single(rig.Email.Sent);
+
+        // New prices extend the plan: email again.
+        rig.Octopus.Available.AddRange(TestHelpers.SlotsFrom(Slot + 20 * Slots.Length, 10, _ => 5m));
+        await rig.Service.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(2, rig.Email.Sent.Count);
     }
 }

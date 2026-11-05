@@ -11,9 +11,12 @@ public class ThermalEstimatorTests
 {
     private static readonly DateTimeOffset T0 = DateTimeOffset.Parse("2026-11-04T12:00:00Z");
 
-    private static readonly TuningSettings Settings = new(MinTemperature: 21.0, OnTemperature: 23.0);
+    private static readonly TuningSettings Settings = new(MinTemperature: 21.0);
 
-    /// <summary>Builds readings every 5 minutes from a list of (state, minutes, temperature at each reading) phases.</summary>
+    /// <summary>
+    /// Builds readings every 5 minutes. Each phase sets the heating state and how fast the temperature moves, so
+    /// floor lag (still falling after switch-on) and disturbances (an oven, the sun) can be simulated.
+    /// </summary>
     private sealed class SeriesBuilder(string name)
     {
         private readonly List<RoomReading> _readings = [];
@@ -26,14 +29,14 @@ public class ThermalEstimatorTests
             return this;
         }
 
-        /// <summary>Adds a phase of <paramref name="minutes"/> with temperature changing by <paramref name="perHour"/> °C/h, capped at <paramref name="cap"/>.</summary>
-        public SeriesBuilder Phase(HeatingState state, int minutes, double perHour, double cap = double.MaxValue)
+        /// <summary>Adds <paramref name="minutes"/> with the heating in <paramref name="state"/> and the temperature changing by <paramref name="perHour"/> °C/h.</summary>
+        public SeriesBuilder Phase(HeatingState state, int minutes, double perHour)
         {
             for (var m = 0; m < minutes; m += 5)
             {
-                _readings.Add(new RoomReading(_t, Math.Round(_temp, 2), state));
+                _readings.Add(new RoomReading(_t, Math.Round(_temp, 3), state));
                 _t += TimeSpan.FromMinutes(5);
-                _temp = Math.Min(cap, _temp + perHour / 12);
+                _temp += perHour / 12;
             }
 
             return this;
@@ -48,238 +51,198 @@ public class ThermalEstimatorTests
         public RoomSeries Build() => new(name, name, _readings);
     }
 
+    private const HeatingState On = HeatingState.On, Off = HeatingState.Off;
+
     [Fact]
-    public void Works_out_max_off_and_ratio_from_cooling_and_heating()
+    public void Works_out_max_off_and_ratio_between_turning_points()
     {
-        // Off 4h cooling 0.5°C/h from 23°C → (23 − 21) / 0.5 = 4h max off.
-        // Then a finished 2h on period heating 2°C/h → ratio 0.5 / 2 = 0.25.
+        // Fall 0.5°C/h from 23°C → (23 − 21) / 0.5 = 4h max off. Rise 1°C/h → ratio 0.5.
+        // The final fall is still in progress, so it isn't measured.
+        var room = new SeriesBuilder("Lounge").Phase(Off, 240, -0.5).Phase(On, 180, 1.0).Phase(Off, 120, -0.5).Build();
+
+        var result = ThermalEstimator.Estimate([room], Settings);
+        var e = Assert.Single(result.Rooms);
+
+        Assert.Equal(1, e.CoolingPeriods);
+        Assert.Equal(1, e.HeatingPeriods);
+        Assert.InRange(e.CoolingPerHour!.Value, 0.45, 0.55);
+        Assert.InRange(e.HeatingPerHour!.Value, 0.9, 1.1);
+        Assert.InRange(result.OnToOffRatio!.Value, 0.45, 0.55);
+        Assert.InRange(result.MaxOffMinutes!.Value, 210, 240);
+    }
+
+    [Fact]
+    public void Floor_lag_is_left_out()
+    {
+        // After switch-on the room keeps falling for 45 min, and after switch-off keeps rising for 30 min.
+        // Measuring between turning points still gives the true rates (1°C/h up, 0.5°C/h down).
         var room = new SeriesBuilder("Lounge")
-            .Phase(HeatingState.Off, 240, -0.5)
-            .Phase(HeatingState.On, 120, 2.0, cap: 23.0)
-            .Phase(HeatingState.Off, 30, -0.5)
+            .Phase(Off, 240, -0.5)
+            .Phase(On, 45, -0.5).Phase(On, 150, 1.0)
+            .Phase(Off, 30, 1.0).Phase(Off, 120, -0.5)
+            .Phase(On, 120, 1.0)
+            .Build();
+
+        var e = Assert.Single(ThermalEstimator.Estimate([room], Settings).Rooms);
+
+        Assert.Equal(1, e.HeatingPeriods);
+        Assert.Equal(2, e.CoolingPeriods);
+        Assert.InRange(e.HeatingPerHour!.Value, 0.9, 1.1);
+        Assert.InRange(e.CoolingPerHour!.Value, 0.45, 0.55);
+    }
+
+    [Fact]
+    public void Short_spike_is_merged_into_the_fall_around_it()
+    {
+        // A 40-minute oven spike (+1°C and back) in the middle of a long fall doesn't split it into two.
+        var room = new SeriesBuilder("Lounge")
+            .StartAt(24.0)
+            .Phase(Off, 150, -0.4).Phase(Off, 20, 3.0).Phase(Off, 20, -3.0).Phase(Off, 170, -0.4)
+            .Phase(On, 150, 1.0)
+            .Phase(Off, 60, -0.4)
+            .Build();
+
+        var e = Assert.Single(ThermalEstimator.Estimate([room], Settings).Rooms);
+
+        Assert.Equal(1, e.CoolingPeriods);
+        Assert.InRange(e.CoolingPerHour!.Value, 0.3, 0.45);
+        Assert.InRange(e.FallStartTemperature!.Value, 23.8, 24.1);
+    }
+
+    [Fact]
+    public void Rise_with_the_heating_off_is_not_counted_as_heating()
+    {
+        // The sun warms the room by 0.5°C/h with the heating off: only the heated rise (1°C/h) counts.
+        var room = new SeriesBuilder("Lounge")
+            .Phase(Off, 240, -0.5).Phase(Off, 120, 0.5).Phase(Off, 120, -0.5)
+            .Phase(On, 180, 1.0)
+            .Phase(Off, 60, -0.5)
+            .Build();
+
+        var e = Assert.Single(ThermalEstimator.Estimate([room], Settings).Rooms);
+
+        Assert.Equal(1, e.HeatingPeriods);
+        Assert.InRange(e.HeatingPerHour!.Value, 0.9, 1.1);
+        Assert.Equal(2, e.CoolingPeriods);
+    }
+
+    [Fact]
+    public void Rise_with_the_heating_on_for_only_part_of_it_is_left_out()
+    {
+        var room = new SeriesBuilder("Lounge")
+            .Phase(Off, 240, -0.5)
+            .Phase(On, 60, 1.0).Phase(Off, 60, 1.0)     // on for half of the rise
+            .Phase(Off, 120, -0.5)
             .Build();
 
         var result = ThermalEstimator.Estimate([room], Settings);
-        var estimate = Assert.Single(result.Rooms);
+        var e = Assert.Single(result.Rooms);
 
-        Assert.Equal(0.5, estimate.CoolingPerHour!.Value, 2);
-        Assert.Equal(240, estimate.MaxOffMinutes!.Value, 0);
-        Assert.Equal(240, result.MaxOffMinutes);
-        Assert.Equal(1, estimate.HeatingPeriods);
-        Assert.Equal(0.25, result.OnToOffRatio!.Value, 2);
-    }
-
-    [Fact]
-    public void Heating_rate_stops_when_room_reaches_on_temperature()
-    {
-        // Heats at 1.5°C/h from 21°C, reaching 23°C after about 80 min, then holds for the rest of a 3h on period.
-        // Using the whole on period would understate the heating rate.
-        var room = new SeriesBuilder("Lounge")
-            .Phase(HeatingState.Off, 240, -0.5)
-            .Phase(HeatingState.On, 180, 1.5, cap: 23.0)
-            .Phase(HeatingState.Off, 30, -0.5)
-            .Build();
-
-        var estimate = Assert.Single(ThermalEstimator.Estimate([room], Settings).Rooms);
-
-        Assert.Equal(1.5, estimate.HeatingPerHour!.Value, 1);
-    }
-
-    [Fact]
-    public void Uses_whole_on_period_when_room_never_warms_up()
-    {
-        var room = new SeriesBuilder("Lounge")
-            .Phase(HeatingState.Off, 240, -0.5)
-            .Phase(HeatingState.On, 90, 1.0)
-            .Phase(HeatingState.Off, 30, -0.5)
-            .Build();
-
-        var estimate = Assert.Single(ThermalEstimator.Estimate([room], Settings).Rooms);
-
-        Assert.Equal(1.0, estimate.HeatingPerHour!.Value, 1);
-        Assert.Equal(0.5, estimate.OnToOffRatio!.Value, 2);
-    }
-
-    [Fact]
-    public void Ignores_on_period_still_in_progress()
-    {
-        // The current on period's early readings mostly show the floor's lag, so only the finished one counts.
-        var room = new SeriesBuilder("Lounge")
-            .Phase(HeatingState.Off, 240, -0.5)
-            .Phase(HeatingState.On, 120, 2.0, cap: 23.0)   // finished: 2°C/h
-            .Phase(HeatingState.Off, 120, -0.5)
-            .Phase(HeatingState.On, 90, 0.05)              // in progress: lag
-            .Build();
-
-        var estimate = Assert.Single(ThermalEstimator.Estimate([room], Settings).Rooms);
-
-        Assert.Equal(1, estimate.HeatingPeriods);
-        Assert.Equal(2.0, estimate.HeatingPerHour!.Value, 1);
-    }
-
-    [Fact]
-    public void Ignores_on_periods_shorter_than_an_hour()
-    {
-        var room = new SeriesBuilder("Lounge")
-            .Phase(HeatingState.Off, 240, -0.5)
-            .Phase(HeatingState.On, 45, 2.0)
-            .Phase(HeatingState.Off, 30, -0.5)
-            .Build();
-
-        var result = ThermalEstimator.Estimate([room], Settings);
-
-        Assert.Equal(0, Assert.Single(result.Rooms).HeatingPeriods);
+        Assert.Equal(0, e.HeatingPeriods);
         Assert.Null(result.OnToOffRatio);
-        Assert.Equal(240, result.MaxOffMinutes);
+        Assert.NotNull(result.MaxOffMinutes);
     }
 
     [Fact]
-    public void Heating_rate_is_median_of_finished_on_periods()
+    public void Heating_rate_is_the_median_of_the_rises()
     {
-        // Three finished cycles heating at 1, 2 and 4°C/h: the median (2°C/h) resists one odd cycle.
-        // Cooling from the longest off period (300 min at 0.4°C/h) → ratio 0.4 / 2 = 0.2.
+        // Rises at 1, 4 and 2°C/h: the median (2) resists one odd cycle. Falls at 0.4°C/h → ratio 0.2.
         var room = new SeriesBuilder("Lounge")
-            .Phase(HeatingState.Off, 300, -0.4)
-            .Phase(HeatingState.On, 90, 1.0)
-            .Phase(HeatingState.Off, 90, -0.4)
-            .Phase(HeatingState.On, 90, 4.0, cap: 30)
-            .Phase(HeatingState.Off, 90, -0.4)
-            .StartAt(21.0)
-            .Phase(HeatingState.On, 90, 2.0, cap: 30)
-            .Phase(HeatingState.Off, 30, -0.4)
+            .Phase(Off, 300, -0.4).Phase(On, 120, 1.0)
+            .Phase(Off, 180, -0.4).Phase(On, 60, 4.0)
+            .Phase(Off, 300, -0.4).Phase(On, 90, 2.0)
+            .Phase(Off, 60, -0.4)
             .Build();
 
-        var estimate = Assert.Single(ThermalEstimator.Estimate([room], Settings with { OnTemperature = 30 }).Rooms);
+        var result = ThermalEstimator.Estimate([room], Settings);
+        var e = Assert.Single(result.Rooms);
 
-        Assert.Equal(3, estimate.HeatingPeriods);
-        Assert.Equal(0.4, estimate.CoolingPerHour!.Value, 2);
-        Assert.Equal(TimeSpan.FromMinutes(300), estimate.OffDuration);
-        Assert.Equal(2.0, estimate.HeatingPerHour!.Value, 1);
-        Assert.Equal(0.2, estimate.OnToOffRatio!.Value, 2);
+        Assert.Equal(3, e.HeatingPeriods);
+        Assert.Equal(3, e.CoolingPeriods);
+        Assert.InRange(e.HeatingPerHour!.Value, 1.8, 2.2);
+        Assert.InRange(e.CoolingPerHour!.Value, 0.36, 0.44);
+        Assert.InRange(result.OnToOffRatio!.Value, 0.17, 0.23);
+    }
+
+    [Fact]
+    public void Movement_in_progress_is_not_measured()
+    {
+        // The rise hasn't turned yet, so only the fall before it counts.
+        var room = new SeriesBuilder("Lounge").Phase(Off, 240, -0.5).Phase(On, 180, 1.0).Build();
+
+        var result = ThermalEstimator.Estimate([room], Settings);
+        var e = Assert.Single(result.Rooms);
+
+        Assert.Equal(1, e.CoolingPeriods);
+        Assert.Equal(0, e.HeatingPeriods);
+        Assert.Null(result.OnToOffRatio);
+        Assert.Contains("no finished rise", e.Note);
     }
 
     [Fact]
     public void Worst_room_decides()
     {
-        var mild = new SeriesBuilder("Mild")
-            .Phase(HeatingState.Off, 240, -0.25).Phase(HeatingState.On, 90, 2.0).Phase(HeatingState.Off, 30, -0.25).Build();
-        var draughty = new SeriesBuilder("Draughty")
-            .Phase(HeatingState.Off, 240, -1.0).Phase(HeatingState.On, 90, 1.0).Phase(HeatingState.Off, 30, -1.0).Build();
+        var mild = new SeriesBuilder("Mild").Phase(Off, 240, -0.25).Phase(On, 120, 2.0).Phase(Off, 60, -0.25).Build();
+        var draughty = new SeriesBuilder("Draughty").Phase(Off, 240, -1.0).Phase(On, 120, 1.0).Phase(Off, 60, -1.0).Build();
 
         var result = ThermalEstimator.Estimate([mild, draughty], Settings);
 
-        Assert.Equal(120, result.MaxOffMinutes);         // draughty: 2°C / 1°C/h
-        Assert.Equal(1.0, result.OnToOffRatio!.Value, 2); // draughty: 1 / 1
+        Assert.InRange(result.MaxOffMinutes!.Value, 90, 120);     // draughty: ~2°C / 1°C/h
+        Assert.InRange(result.OnToOffRatio!.Value, 0.9, 1.1);     // draughty: 1 / 1
     }
 
     [Fact]
     public void Max_off_is_rounded_down_to_whole_slots_and_clamped()
     {
-        // 2°C / 0.7°C/h = 171 min → 150.
-        var room = new SeriesBuilder("A").Phase(HeatingState.Off, 240, -0.7).Phase(HeatingState.On, 30, 1.0).Build();
+        // ~2°C / 0.7°C/h ≈ 170 min → 150.
+        var room = new SeriesBuilder("A").Phase(Off, 240, -0.7).Phase(On, 60, 1.0).Build();
         Assert.Equal(150, ThermalEstimator.Estimate([room], Settings).MaxOffMinutes);
 
         // Very fast cooling → below the lower bound → 60.
-        var cold = new SeriesBuilder("B").Phase(HeatingState.Off, 120, -3.0).Phase(HeatingState.On, 30, 1.0).Build();
+        var cold = new SeriesBuilder("B").Phase(Off, 120, -3.0).Phase(On, 60, 2.0).Build();
         Assert.Equal(60, ThermalEstimator.Estimate([cold], Settings).MaxOffMinutes);
 
-        // Warming while off (sun) → no measurable cooling → upper bound.
-        var sunny = new SeriesBuilder("C").Phase(HeatingState.Off, 120, 0.3).Phase(HeatingState.On, 30, 1.0).Build();
-        var result = ThermalEstimator.Estimate([sunny], Settings);
-        Assert.Equal(720, result.MaxOffMinutes);
-        Assert.Null(result.OnToOffRatio);
+        // Slow cooling → above the upper bound → 720.
+        var slow = new SeriesBuilder("C").Phase(Off, 600, -0.05).Phase(On, 120, 1.0).Build();
+        Assert.Equal(720, ThermalEstimator.Estimate([slow], Settings).MaxOffMinutes);
     }
 
     [Fact]
-    public void Off_period_starting_below_minimum_gives_lower_bound()
+    public void Fall_starting_below_minimum_gives_lower_bound()
     {
-        var room = new SeriesBuilder("A").StartAt(20.5).Phase(HeatingState.Off, 120, -0.5).Phase(HeatingState.On, 30, 1.0).Build();
+        var room = new SeriesBuilder("A").StartAt(20.5).Phase(Off, 120, -0.5).Phase(On, 60, 1.0).Build();
         Assert.Equal(60, ThermalEstimator.Estimate([room], Settings).MaxOffMinutes);
-    }
-
-    [Fact]
-    public void Ignores_off_period_still_in_progress()
-    {
-        // The current off period has run longest, but its early part shows heat still coming out of the floor,
-        // so cooling is measured from the finished one (0.5°C/h → 4h max off) instead.
-        var room = new SeriesBuilder("Lounge")
-            .Phase(HeatingState.Off, 240, -0.5)
-            .Phase(HeatingState.On, 120, 2.0, cap: 23.0)
-            .Phase(HeatingState.Off, 300, -0.05)   // in progress, longer, slow at first
-            .Build();
-
-        var estimate = Assert.Single(ThermalEstimator.Estimate([room], Settings).Rooms);
-
-        Assert.Equal(TimeSpan.FromMinutes(240), estimate.OffDuration);
-        Assert.Equal(0.5, estimate.CoolingPerHour!.Value, 2);
-    }
-
-    [Fact]
-    public void No_finished_off_period_gives_nothing()
-    {
-        var room = new SeriesBuilder("A").Phase(HeatingState.On, 60, 1.0).Phase(HeatingState.Off, 240, -0.5).Build();
-        var result = ThermalEstimator.Estimate([room], Settings);
-
-        Assert.Null(result.MaxOffMinutes);
-        Assert.Contains("no finished off period", Assert.Single(result.Rooms).Note);
     }
 
     [Fact]
     public void Returns_nothing_without_enough_data()
     {
-        var shortOff = new SeriesBuilder("A").Phase(HeatingState.On, 60, 1.0).Phase(HeatingState.Off, 45, -0.5).Build();
-        var result = ThermalEstimator.Estimate([shortOff], Settings);
+        var flat = new SeriesBuilder("A").Phase(Off, 240, -0.02).Phase(On, 120, 0.02).Build();
+        var result = ThermalEstimator.Estimate([flat], Settings);
 
         Assert.Null(result.MaxOffMinutes);
         Assert.Null(result.OnToOffRatio);
-        Assert.NotNull(Assert.Single(result.Rooms).Note);
+        Assert.Contains("no finished fall", Assert.Single(result.Rooms).Note);
     }
 
     [Fact]
-    public void Ratio_needs_a_measurable_rise()
+    public void Movements_spanning_a_gap_are_left_out()
     {
-        // Underfloor lag: the room keeps cooling slightly throughout an on period.
         var room = new SeriesBuilder("A")
-            .Phase(HeatingState.Off, 240, -0.5).Phase(HeatingState.On, 90, -0.1).Phase(HeatingState.Off, 30, -0.5).Build();
-        var result = ThermalEstimator.Estimate([room], Settings);
-
-        Assert.Equal(240, result.MaxOffMinutes);
-        Assert.Null(result.OnToOffRatio);
-        Assert.Contains("no measurable warming", Assert.Single(result.Rooms).Note);
-    }
-
-    [Fact]
-    public void Gaps_split_periods()
-    {
-        // Two 50-minute off stretches separated by a 1h gap: neither reaches the 60 min minimum.
-        var room = new SeriesBuilder("A")
-            .Phase(HeatingState.Off, 50, -0.5)
-            .Gap(60)
-            .Phase(HeatingState.Off, 50, -0.5)
+            .Phase(Off, 120, -0.5).Gap(60).Phase(Off, 120, -0.5)
+            .Phase(On, 180, 1.0).Gap(60).Phase(On, 1, 1.0).Phase(Off, 120, -0.5)
             .Build();
 
-        Assert.Null(ThermalEstimator.Estimate([room], Settings).MaxOffMinutes);
-    }
+        var result = ThermalEstimator.Estimate([room], Settings);
+        var e = Assert.Single(result.Rooms);
 
-    [Fact]
-    public void On_period_after_or_before_a_gap_is_not_used_for_heating()
-    {
-        var afterGap = new SeriesBuilder("A")
-            .Phase(HeatingState.Off, 240, -0.5).Phase(HeatingState.On, 30, 1.0)
-            .Gap(60).Phase(HeatingState.On, 90, 2.0).Phase(HeatingState.Off, 30, -0.5).Build();
-        var beforeGap = new SeriesBuilder("B")
-            .Phase(HeatingState.Off, 240, -0.5).Phase(HeatingState.On, 90, 2.0).Gap(60).Phase(HeatingState.Off, 30, -0.5).Build();
-
-        foreach (var room in new[] { afterGap, beforeGap })
-        {
-            var result = ThermalEstimator.Estimate([room], Settings);
-            Assert.Equal(240, result.MaxOffMinutes);
-            Assert.Null(result.OnToOffRatio);
-        }
+        Assert.Equal(0, e.CoolingPeriods);
+        Assert.Equal(0, e.HeatingPeriods);
+        Assert.Null(result.MaxOffMinutes);
     }
 }
 
-public class ThermalTuningServiceTests
+public class ThermalTunerTests
 {
     private static readonly DateTimeOffset Now = DateTimeOffset.Parse("2026-11-04T18:00:00Z");
 
@@ -316,11 +279,11 @@ public class ThermalTuningServiceTests
         VacationMode = vacation,
     };
 
-    /// <summary>4h off cooling 1°C/h from 23°C, 1.5h on heating 2°C/h, then 30 min off, as 5-minute rows ending at <see cref="Now"/>.</summary>
+    /// <summary>4h off cooling 1°C/h from 23°C, 1.5h on heating 2°C/h, then 1h off, as 5-minute rows ending at <see cref="Now"/>.</summary>
     private static List<RoomTimeSeriesRow> CoolThenHeat(double offSetpoint = 16, double onSetpoint = 23)
     {
         var rows = new List<RoomTimeSeriesRow>();
-        var t = Now - TimeSpan.FromHours(6);
+        var t = Now - TimeSpan.FromHours(6.5);
         var temp = 23.0;
         for (var m = 0; m < 240; m += 5, t += TimeSpan.FromMinutes(5), temp -= 1.0 / 12)
         {
@@ -332,7 +295,7 @@ public class ThermalTuningServiceTests
             rows.Add(new RoomTimeSeriesRow { Timestamp = t, AirTemperature = temp, SetpointTemperature = onSetpoint });
         }
 
-        for (var m = 0; m < 30; m += 5, t += TimeSpan.FromMinutes(5), temp -= 1.0 / 12)
+        for (var m = 0; m < 60; m += 5, t += TimeSpan.FromMinutes(5), temp -= 1.0 / 12)
         {
             rows.Add(new RoomTimeSeriesRow { Timestamp = t, AirTemperature = temp, SetpointTemperature = offSetpoint });
         }
@@ -340,18 +303,18 @@ public class ThermalTuningServiceTests
         return rows;
     }
 
-    private static (ThermalTuningService Service, HeatingSchedule Schedule) Create(FakeWavin wavin, WavinOptions? wavinOptions = null)
+    private static (ThermalTuner Service, HeatingSchedule Schedule) Create(FakeWavin wavin, WavinOptions? wavinOptions = null)
     {
         var schedule = new HeatingSchedule(
             TestHelpers.Opt(new ScheduleOptions { OnToOffRatio = 0.25, MaxOffMinutes = 600, MinOnMinutes = 60 }),
             NullLogger<HeatingSchedule>.Instance);
-        var service = new ThermalTuningService(
+        var service = new ThermalTuner(
             wavin, schedule,
             TestHelpers.Opt(new TuningOptions { MinTemperature = 21 }),
             TestHelpers.Opt(wavinOptions ?? new WavinOptions()),
             TestHelpers.Opt(new HeatingOptions { OnTemperature = 23, OffTemperature = 16 }),
             new FakeTimeProvider(Now),
-            NullLogger<ThermalTuningService>.Instance);
+            NullLogger<ThermalTuner>.Instance);
         return (service, schedule);
     }
 
@@ -368,7 +331,7 @@ public class ThermalTuningServiceTests
         Assert.Equal(2, schedule.Rules.MinOnSlots);          // unchanged
 
         var call = Assert.Single(wavin.HistoryCalls);
-        Assert.Equal(("1", Now - TimeSpan.FromHours(24), Now, 5), call);
+        Assert.Equal(("1", Now - TimeSpan.FromHours(48), Now, 5), call);
     }
 
     [Fact]
@@ -420,13 +383,13 @@ public class ThermalTuningServiceTests
         var schedule = new HeatingSchedule(
             TestHelpers.Opt(new ScheduleOptions { OnToOffRatio = 0.25, MaxOffMinutes = 600, MinOnMinutes = 60 }),
             NullLogger<HeatingSchedule>.Instance);
-        var service = new ThermalTuningService(
+        var service = new ThermalTuner(
             wavin, schedule,
             TestHelpers.Opt(new TuningOptions { MinTemperature = 21, Rooms = ["lobby"] }),
             TestHelpers.Opt(new WavinOptions()),
             TestHelpers.Opt(new HeatingOptions { OnTemperature = 23, OffTemperature = 16 }),
             new FakeTimeProvider(Now),
-            NullLogger<ThermalTuningService>.Instance);
+            NullLogger<ThermalTuner>.Instance);
 
         var result = await service.RunOnceAsync(CancellationToken.None);
 

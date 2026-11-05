@@ -9,6 +9,9 @@ public sealed record DesiredState(HeatingState State, bool IsFallback);
 
 public sealed record PlannedSlot(DateTimeOffset Start, HeatingState State, decimal Price);
 
+/// <summary>The current slot's decision, the plan after it, and the rules it was made with.</summary>
+public sealed record PlanSnapshot(DateTimeOffset? CurrentSlot, DesiredState? Current, IReadOnlyList<PlannedSlot> Upcoming, RatioRules Rules);
+
 public interface IHeatingSchedule
 {
     /// <summary>The state for the slot containing <paramref name="utcNow"/>. Fixed once decided.</summary>
@@ -22,15 +25,19 @@ public interface IHeatingSchedule
 /// <summary>
 /// Thread-safe store of known prices and committed slot decisions, shared by both background services.
 /// <para>
-/// Works as a rolling-horizon planner: when a slot starts, the solver plans the next <see cref="Horizon"/>
-/// (or as far as prices are known) from the actual history, and the first slot of that plan is committed.
-/// Committed slots never change; the rest of the plan is recomputed as time passes and new prices arrive.
+/// When a slot starts, the solver plans over every known price (up to <see cref="MaxHorizon"/> ahead) from the actual
+/// history, and the first slot of that plan is committed. Committed slots never change. Because the plan always runs to
+/// the end of the known prices, it only changes when new prices arrive (about once a day), when the rules change, or
+/// after a restart.
 /// </para>
 /// </summary>
 public sealed class HeatingSchedule : IHeatingSchedule
 {
-    /// <summary>How far ahead the solver plans (rolling), limited by how far ahead prices are published.</summary>
-    public static readonly TimeSpan Horizon = TimeSpan.FromHours(24);
+    /// <summary>
+    /// Furthest ahead the solver plans. In practice the plan ends where the published prices end: Octopus publishes the
+    /// next day's prices at about 16:00, so the plan reaches 7–31 hours ahead.
+    /// </summary>
+    public static readonly TimeSpan MaxHorizon = TimeSpan.FromHours(48);
 
     private static readonly TimeSpan MaxCatchUp = TimeSpan.FromHours(24);
 
@@ -39,6 +46,10 @@ public sealed class HeatingSchedule : IHeatingSchedule
     private RatioRules _rules;
     private readonly Lock _lock = new();
     private readonly SortedDictionary<DateTimeOffset, decimal> _prices = [];
+
+    // Value of each make-up slot still owed when the plan ends. Fixed when new prices arrive (the average of the known
+    // prices then), so re-planning as slots pass gives the same plan rather than shifting with a moving average.
+    private decimal? _owedSlotPrice;
     private readonly Dictionary<DateTimeOffset, DesiredState> _committed = [];
     private readonly TaskCompletionSource _firstAttempt = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -104,6 +115,21 @@ public sealed class HeatingSchedule : IHeatingSchedule
         }
     }
 
+    /// <summary>A consistent snapshot of the current decision, the plan after it and the rules in force.</summary>
+    public PlanSnapshot GetSnapshot()
+    {
+        lock (_lock)
+        {
+            if (_nextSlot is not { } next)
+            {
+                return new PlanSnapshot(null, null, [], _rules);
+            }
+
+            var current = next - Slots.Length;
+            return new PlanSnapshot(current, _committed.GetValueOrDefault(current), _plan, _rules);
+        }
+    }
+
     /// <summary>End of the unbroken run of known prices starting at <paramref name="fromSlot"/>.</summary>
     public DateTimeOffset PricesKnownUntil(DateTimeOffset fromSlot)
     {
@@ -123,9 +149,17 @@ public sealed class HeatingSchedule : IHeatingSchedule
     {
         lock (_lock)
         {
+            var endBefore = _prices.Count > 0 ? _prices.Keys.Last() : DateTimeOffset.MinValue;
             foreach (var slot in slots)
             {
                 _prices[slot.ValidFrom] = slot.PriceIncVat;
+            }
+
+            var current = Slots.StartFor(utcNow);
+            var future = _prices.Where(p => p.Key >= current).Select(p => p.Value).ToList();
+            if (future.Count > 0 && (_owedSlotPrice is null || _prices.Keys.Last() > endBefore))
+            {
+                _owedSlotPrice = future.Average();
             }
 
             CommitUpTo(utcNow);
@@ -225,7 +259,7 @@ public sealed class HeatingSchedule : IHeatingSchedule
     /// <summary>Solves the schedule from <paramref name="from"/> over the known prices within the horizon, starting from the current history.</summary>
     private List<PlannedSlot> PlanFrom(DateTimeOffset from)
     {
-        var end = from + Horizon;
+        var end = from + MaxHorizon;
         var starts = new List<DateTimeOffset>();
         var prices = new List<decimal>();
         for (var t = from; t < end && _prices.TryGetValue(t, out var price); t += Slots.Length)
@@ -234,7 +268,7 @@ public sealed class HeatingSchedule : IHeatingSchedule
             prices.Add(price);
         }
 
-        var result = RatioScheduleSolver.Solve(prices, _history, _rules);
+        var result = RatioScheduleSolver.Solve(prices, _history, _rules, _owedSlotPrice);
         return starts
             .Select((s, i) => new PlannedSlot(s, result.On[i] ? HeatingState.On : HeatingState.Off, prices[i]))
             .ToList();
