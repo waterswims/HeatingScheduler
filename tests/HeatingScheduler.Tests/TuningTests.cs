@@ -405,7 +405,7 @@ public class ThermalTunerTests
         Assert.Equal(2, schedule.Rules.MinOnSlots);          // unchanged
 
         var call = Assert.Single(wavin.HistoryCalls);
-        Assert.Equal(("1", Now - TimeSpan.FromHours(60), Now, 5), call);
+        Assert.Equal(("1", Now - TimeSpan.FromHours(84), Now, 5), call);
     }
 
     [Fact]
@@ -435,17 +435,17 @@ public class ThermalTunerTests
     }
 
     [Fact]
-    public async Task Ignores_readings_with_other_setpoints()
+    public async Task Works_after_the_on_and_off_temperatures_change()
     {
-        // Setpoints that are neither the on nor the off temperature (e.g. set by hand) don't count as off or on.
+        // History recorded with 19°C off and 21°C on, while the settings now say 16 and 23: the rises and falls of the
+        // setpoint still say when the heating was on, so the result is the same as with matching temperatures.
         var wavin = new FakeWavin(new() { ["1"] = CoolThenHeat(offSetpoint: 19, onSetpoint: 21) }, Room("1", "Lounge"));
         var (service, schedule) = Create(wavin);
 
-        var result = await service.RunOnceAsync(CancellationToken.None);
+        await service.RunOnceAsync(CancellationToken.None);
 
-        Assert.Equal("Lounge", Assert.Single(result.Rooms).Name);
-        Assert.Null(result.MaxOffMinutes);
-        Assert.Equal(20, schedule.Rules.MaxOffSlots);
+        Assert.Equal(4, schedule.Rules.MaxOffSlots);
+        Assert.Equal(0.5, schedule.Rules.OnToOffRatio, 2);
     }
 
     [Fact]
@@ -482,5 +482,57 @@ public class ThermalTunerTests
         await service.RunOnceAsync(CancellationToken.None);
 
         Assert.Equal(["1"], wavin.HistoryCalls.Select(c => c.RoomId));
+    }
+}
+
+public class SetpointClassificationTests
+{
+    private static readonly DateTimeOffset T0 = DateTimeOffset.Parse("2026-11-07T00:00:00Z");
+    private static readonly HeatingOptions Heating = new() { OnTemperature = 23, OffTemperature = 16 };
+
+    private static List<RoomTimeSeriesRow> Rows(params double?[] setpoints) =>
+        setpoints.Select((s, i) => new RoomTimeSeriesRow { Timestamp = T0.AddMinutes(5 * i), AirTemperature = 22, SetpointTemperature = s }).ToList();
+
+    private static string States(List<RoomReading> readings) =>
+        string.Concat(readings.Select(r => r.State == HeatingState.On ? '1' : '0'));
+
+    [Fact]
+    public void Rise_turns_on_and_fall_turns_off()
+    {
+        Assert.Equal("000111000", States(ThermalTuner.ClassifyBySetpointChanges(Rows(16, 16, 16, 23, 23, 23, 16, 16, 16), Heating)));
+    }
+
+    [Fact]
+    public void Readings_before_the_first_change_take_the_opposite_state()
+    {
+        Assert.Equal("1100", States(ThermalTuner.ClassifyBySetpointChanges(Rows(21, 21, 18, 18), Heating)));
+        Assert.Equal("0011", States(ThermalTuner.ClassifyBySetpointChanges(Rows(18, 18, 21, 21), Heating)));
+    }
+
+    [Fact]
+    public void Works_with_any_temperatures_and_intermediate_steps()
+    {
+        // A bucket spanning a switch can show an in-between setpoint; both steps are rises, so both are on.
+        Assert.Equal("001111000", States(ThermalTuner.ClassifyBySetpointChanges(Rows(17, 17, 19.5, 22, 22, 22, 18, 18, 18), Heating)));
+    }
+
+    [Fact]
+    public void Without_any_change_matches_the_configured_temperatures()
+    {
+        Assert.Equal("111", States(ThermalTuner.ClassifyBySetpointChanges(Rows(23, 23, 23), Heating)));
+        Assert.Equal("000", States(ThermalTuner.ClassifyBySetpointChanges(Rows(16, 16, 16), Heating)));
+        Assert.Empty(ThermalTuner.ClassifyBySetpointChanges(Rows(19, 19, 19), Heating));
+    }
+
+    [Fact]
+    public void Missing_values_are_skipped_but_changes_are_still_followed()
+    {
+        var rows = Rows(16, 16, null, 23, 23, 23);
+        rows[4].AirTemperature = null;    // no air temperature: left out, but its setpoint still counts
+
+        var readings = ThermalTuner.ClassifyBySetpointChanges(rows, Heating);
+
+        Assert.Equal("0011", States(readings));
+        Assert.Equal(4, readings.Count);
     }
 }

@@ -25,7 +25,7 @@ public sealed class ThermalTuner(
     public const int BucketMinutes = 5;
 
     /// <summary>How much room history is analysed: enough for several heating cycles.</summary>
-    public static readonly TimeSpan History = TimeSpan.FromHours(48);
+    public static readonly TimeSpan History = TimeSpan.FromHours(72);
 
     /// <summary>
     /// Extra history fetched before <see cref="History"/>, only to confirm the turning points near the start of the
@@ -70,10 +70,9 @@ public sealed class ThermalTuner(
     }
 
     /// <summary>
-    /// Fetches the last <see cref="History"/> of each room to tune against
-    /// (<see cref="TuningOptions.Rooms"/>, or every controlled room). A reading counts as on or off
-    /// when its setpoint is the on or off temperature; other setpoints (manual changes, or a bucket spanning a switch)
-    /// are left out.
+    /// Fetches the last <see cref="History"/> (plus <see cref="Context"/>) of each room to tune against
+    /// (<see cref="TuningOptions.Rooms"/>, or every controlled room), and labels each reading on or off with
+    /// <see cref="ClassifyBySetpointChanges"/>.
     /// </summary>
     private async Task<IReadOnlyList<RoomSeries>> FetchHistoryAsync(CancellationToken cancellationToken)
     {
@@ -97,13 +96,7 @@ public sealed class ThermalTuner(
             foreach (var room in rooms)
             {
                 var rows = await wavin.GetRoomTimeSeriesAsync(device.Name, room.IdText, start, end, BucketMinutes, cancellationToken);
-                var readings = rows
-                    .Where(r => r.AirTemperature is not null && r.SetpointTemperature is not null)
-                    .Select(r => (Row: r, State: Classify(r.SetpointTemperature!.Value, heating)))
-                    .Where(x => x.State is not null)
-                    .Select(x => new RoomReading(x.Row.Timestamp, x.Row.AirTemperature!.Value, x.State!.Value))
-                    .OrderBy(r => r.At)
-                    .ToList();
+                var readings = ClassifyBySetpointChanges(rows, heating);
                 series.Add(new RoomSeries($"{device.Name}/{room.IdText}", room.DisplayName, readings));
             }
         }
@@ -111,7 +104,63 @@ public sealed class ThermalTuner(
         return series;
     }
 
-    private static HeatingState? Classify(double setpoint, HeatingOptions heating) =>
+    /// <summary>
+    /// Labels each reading on or off from changes in the room's setpoint: a rise turns the heating on and a fall turns
+    /// it off, whatever the temperatures. Changing the on or off temperature therefore doesn't invalidate the history.
+    /// Readings before the first change take the opposite state to that change (a first rise means it was off before).
+    /// If the setpoint never changes, the reading is matched against the current on and off temperatures, or left out
+    /// if it matches neither. Readings without an air temperature are left out but still followed for changes.
+    /// </summary>
+    public static List<RoomReading> ClassifyBySetpointChanges(IReadOnlyList<RoomTimeSeriesRow> rows, HeatingOptions heating)
+    {
+        var ordered = rows.Where(r => r.SetpointTemperature is not null).OrderBy(r => r.Timestamp).ToList();
+        var states = new HeatingState?[ordered.Count];
+        HeatingState? state = null;
+        var firstChange = -1;
+        for (var i = 1; i < ordered.Count; i++)
+        {
+            var change = ordered[i].SetpointTemperature!.Value - ordered[i - 1].SetpointTemperature!.Value;
+            if (Math.Abs(change) > SetpointTolerance)
+            {
+                state = change > 0 ? HeatingState.On : HeatingState.Off;
+                if (firstChange < 0)
+                {
+                    firstChange = i;
+                }
+            }
+
+            states[i] = state;
+        }
+
+        if (firstChange < 0)
+        {
+            for (var i = 0; i < ordered.Count; i++)
+            {
+                states[i] = MatchConfigured(ordered[i].SetpointTemperature!.Value, heating);
+            }
+        }
+        else
+        {
+            var before = states[firstChange] == HeatingState.On ? HeatingState.Off : HeatingState.On;
+            for (var i = 0; i < firstChange; i++)
+            {
+                states[i] = before;
+            }
+        }
+
+        var readings = new List<RoomReading>();
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            if (ordered[i].AirTemperature is { } air && states[i] is { } s)
+            {
+                readings.Add(new RoomReading(ordered[i].Timestamp, air, s));
+            }
+        }
+
+        return readings;
+    }
+
+    private static HeatingState? MatchConfigured(double setpoint, HeatingOptions heating) =>
         Math.Abs(setpoint - heating.OnTemperature) <= SetpointTolerance ? HeatingState.On
         : Math.Abs(setpoint - heating.OffTemperature) <= SetpointTolerance ? HeatingState.Off
         : null;
