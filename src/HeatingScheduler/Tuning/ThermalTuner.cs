@@ -27,6 +27,12 @@ public sealed class ThermalTuner(
     /// <summary>How much room history is analysed: enough for several heating cycles.</summary>
     public static readonly TimeSpan History = TimeSpan.FromHours(48);
 
+    /// <summary>
+    /// Extra history fetched before <see cref="History"/>, only to confirm the turning points near the start of the
+    /// window; movements starting in it are not counted.
+    /// </summary>
+    public static readonly TimeSpan Context = TimeSpan.FromHours(12);
+
     /// <summary>A newly measured ratio is only applied when it differs from the current one by more than this fraction.</summary>
     public const double RatioChangeThreshold = 0.1;
 
@@ -39,7 +45,7 @@ public sealed class ThermalTuner(
     {
         var history = await FetchHistoryAsync(cancellationToken);
 
-        var settings = new TuningSettings(tuningOptions.Value.MinTemperature);
+        var settings = new TuningSettings(tuningOptions.Value.MinTemperature, CountFrom: timeProvider.GetUtcNow() - History);
 
         var result = ThermalEstimator.Estimate(history, settings);
         var current = schedule.Rules;
@@ -72,7 +78,7 @@ public sealed class ThermalTuner(
     private async Task<IReadOnlyList<RoomSeries>> FetchHistoryAsync(CancellationToken cancellationToken)
     {
         var end = timeProvider.GetUtcNow();
-        var start = end - History;
+        var start = end - History - Context;
         var heating = heatingOptions.Value;
 
         var series = new List<RoomSeries>();

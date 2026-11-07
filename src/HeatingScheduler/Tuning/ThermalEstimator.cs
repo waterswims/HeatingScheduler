@@ -7,7 +7,12 @@ public sealed record RoomReading(DateTimeOffset At, double AirTemperature, Heati
 
 public sealed record RoomSeries(string Key, string Name, IReadOnlyList<RoomReading> Readings);
 
-public sealed record TuningSettings(double MinTemperature);
+/// <param name="MinTemperature">Temperature every room should stay above during an off period.</param>
+/// <param name="CountFrom">
+/// Only rises and falls starting at or after this time are counted. Readings before it are context, used to confirm the
+/// turning points near the start of the window.
+/// </param>
+public sealed record TuningSettings(double MinTemperature, DateTimeOffset? CountFrom = null);
 
 /// <summary>What was measured for one room. Rates are in °C per hour; null means it could not be measured.</summary>
 public sealed record RoomEstimate(
@@ -39,7 +44,8 @@ public sealed record TuningResult(double? OnToOffRatio, int? MaxOffMinutes, IRea
 /// <item><b>Which movements count:</b> a rise counts as heating when the heating was on for at least
 /// <see cref="HeatingOnFraction"/> of it; a fall counts as cooling when the heating was on for at most
 /// <see cref="CoolingOnFraction"/> of it. Movements with the heating mixed, or with a gap in the readings, are left out.
-/// Only movements between two confirmed turning points are used, so the one in progress is never measured.</item>
+/// Only movements between two confirmed turning points are used, so neither the one in progress nor one cut off by the
+/// start of the history window is measured.</item>
 /// <item><b>Rates:</b> each rise or fall is measured by a straight-line (least-squares) fit through its raw readings;
 /// the smoothed readings are only used to find the turning points. The heating and cooling rates are the medians over
 /// the counted rises and falls.</item>
@@ -67,7 +73,7 @@ public static class ThermalEstimator
     public const double CoolingOnFraction = 0.3;
 
     /// <summary>Range the maximum off period is kept within (minutes).</summary>
-    public const int MaxOffLowerBoundMinutes = 60, MaxOffUpperBoundMinutes = 720;
+    public const int MaxOffLowerBoundMinutes = 60, MaxOffUpperBoundMinutes = 1440;
 
     /// <summary>Range the make-up ratio is kept within.</summary>
     public const double RatioLowerBound = 0.05, RatioUpperBound = 3.0;
@@ -106,7 +112,8 @@ public static class ThermalEstimator
     private static RoomEstimate EstimateRoom(RoomSeries room, TuningSettings settings)
     {
         var readings = room.Readings;
-        var legs = Legs(readings).Where(l => !l.HasGap).ToList();
+        var countFrom = settings.CountFrom ?? DateTimeOffset.MinValue;
+        var legs = Legs(readings).Where(l => !l.HasGap && readings[l.From].At >= countFrom).ToList();
 
         var falls = legs.Where(l => !l.IsRise && l.OnFraction <= CoolingOnFraction).ToList();
         var rises = legs.Where(l => l.IsRise && l.OnFraction >= HeatingOnFraction).ToList();
@@ -161,7 +168,8 @@ public static class ThermalEstimator
     private static List<Leg> Legs(IReadOnlyList<RoomReading> readings)
     {
         var smoothed = Smooth(readings);
-        var points = Refine(readings, RemoveShortLegs(readings, smoothed, TurningPoints(smoothed)));
+        var points = DropUnconfirmedStart(smoothed,
+            Refine(readings, RemoveShortLegs(readings, smoothed, TurningPoints(smoothed))));
 
         var legs = new List<Leg>();
         for (var k = 0; k + 1 < points.Count; k++)
@@ -306,6 +314,14 @@ public static class ThermalEstimator
                 break;
             }
 
+            // At either end there is nothing to merge with: the short movement touches the edge of the history, so
+            // drop its outer point (the start or the end of the history) and keep the real turning point.
+            if (shortest == 0)
+            {
+                points.RemoveAt(0);
+                continue;
+            }
+
             if (shortest + 2 >= points.Count)
             {
                 points.RemoveAt(shortest + 1);
@@ -322,6 +338,32 @@ public static class ThermalEstimator
             {
                 points.RemoveRange(shortest, 2);
             }
+        }
+
+        return points;
+    }
+
+    /// <summary>
+    /// Drops the first turning point unless the readings before it show it really was one: a trough needs a fall of at
+    /// least <see cref="MinSwing"/> into it, a peak a rise of at least <see cref="MinSwing"/>. Otherwise it is just where
+    /// the history window happens to start (for example part-way up a rise), and the movement from it would be measured
+    /// over only part of its length.
+    /// </summary>
+    private static List<TurningPoint> DropUnconfirmedStart(double[] t, List<TurningPoint> points)
+    {
+        if (points.Count == 0)
+        {
+            return points;
+        }
+
+        var first = points[0];
+        var before = t.Take(first.Index + 1).ToList();
+        var confirmed = first.IsPeak
+            ? before.Min() <= t[first.Index] - MinSwing
+            : before.Max() >= t[first.Index] + MinSwing;
+        if (!confirmed)
+        {
+            points.RemoveAt(0);
         }
 
         return points;
