@@ -11,15 +11,14 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddSystemd();
 
 builder.Services.AddOptions<OctopusOptions>().BindConfiguration(OctopusOptions.SectionName).ValidateDataAnnotations().ValidateOnStart();
-builder.Services.AddOptions<ScheduleOptions>().BindConfiguration(ScheduleOptions.SectionName).ValidateDataAnnotations().ValidateOnStart();
+builder.Services.AddOptions<ScheduleOptions>().BindConfiguration(ScheduleOptions.SectionName).ValidateDataAnnotations()
+    .Validate<IOptions<HeatingOptions>>(
+        (schedule, heating) => schedule.MinTemperature > heating.Value.OffTemperature && schedule.Floor < heating.Value.OnTemperature,
+        "Schedule:MinTemperature must be above Heating:OffTemperature, and MinTemperature + SafetyMargin below Heating:OnTemperature.")
+    .ValidateOnStart();
 builder.Services.AddOptions<WavinOptions>().BindConfiguration(WavinOptions.SectionName).ValidateDataAnnotations().ValidateOnStart();
 builder.Services.AddOptions<HeatingOptions>().BindConfiguration(HeatingOptions.SectionName).ValidateDataAnnotations().ValidateOnStart();
-builder.Services.AddOptions<TuningOptions>().BindConfiguration(TuningOptions.SectionName).ValidateDataAnnotations()
-    .Validate<IOptions<HeatingOptions>>(
-        (tuning, heating) => !tuning.Enabled ||
-            (tuning.MinTemperature > heating.Value.OffTemperature && tuning.MinTemperature < heating.Value.OnTemperature),
-        "Tuning:MinTemperature must be between Heating:OffTemperature and Heating:OnTemperature.")
-    .ValidateOnStart();
+builder.Services.AddOptions<TuningOptions>().BindConfiguration(TuningOptions.SectionName);
 builder.Services.AddOptions<EmailOptions>().BindConfiguration(EmailOptions.SectionName).ValidateDataAnnotations().ValidateOnStart();
 
 builder.Services.AddSingleton(TimeProvider.System);

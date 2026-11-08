@@ -16,9 +16,18 @@ public static class WavinSelection
         return devices;
     }
 
-    /// <summary>The rooms matching <see cref="WavinOptions.Rooms"/> (by id or title), or all rooms when the list is empty.</summary>
+    /// <summary>The rooms matching <paramref name="filter"/> (by id or title), or all rooms when the list is empty.</summary>
     public static IEnumerable<WavinRoom> SelectRooms(IReadOnlyList<WavinRoom> rooms, IReadOnlyList<string> filter) =>
         filter.Count == 0 ? rooms : rooms.Where(r => filter.Any(e => Matches(r, e)));
+
+    /// <summary>
+    /// The rooms whose temperature the plan tracks: controlled rooms (<paramref name="controlFilter"/>) not in vacation
+    /// mode, narrowed to <paramref name="trackFilter"/> when it is set. Keyed by device and room id.
+    /// </summary>
+    public static IEnumerable<(string Key, WavinRoom Room)> TrackedRooms(
+        IReadOnlyList<WavinDevice> devices, IReadOnlyList<string> controlFilter, IReadOnlyList<string> trackFilter) =>
+        devices.SelectMany(d => SelectRooms(SelectRooms(d.Rooms, controlFilter).Where(r => !r.IsInVacationMode).ToList(), trackFilter)
+            .Select(r => (Key: $"{d.Name}/{r.IdText}", Room: r)));
 
     public static bool Matches(WavinRoom room, string entry) =>
         string.Equals(room.IdText, entry, StringComparison.OrdinalIgnoreCase) ||

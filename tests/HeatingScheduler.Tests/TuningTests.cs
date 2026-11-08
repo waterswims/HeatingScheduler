@@ -11,7 +11,7 @@ public class ThermalEstimatorTests
 {
     private static readonly DateTimeOffset T0 = DateTimeOffset.Parse("2026-11-04T12:00:00Z");
 
-    private static readonly TuningSettings Settings = new(MinTemperature: 21.0);
+    private static readonly TuningSettings Settings = new();
 
     /// <summary>
     /// Builds readings every 5 minutes. Each phase sets the heating state and how fast the temperature moves, so
@@ -64,10 +64,9 @@ public class ThermalEstimatorTests
     private const HeatingState On = HeatingState.On, Off = HeatingState.Off;
 
     [Fact]
-    public void Works_out_max_off_and_ratio_between_turning_points()
+    public void Measures_cooling_and_heating_between_turning_points()
     {
-        // Fall 0.5°C/h from 23°C → (23 − 21) / 0.5 = 4h max off. Rise 1°C/h → ratio 0.5.
-        // The final fall is still in progress, so it isn't measured.
+        // Fall 0.5°C/h, rise 1°C/h. The final fall is still in progress, so it isn't measured.
         var room = new SeriesBuilder("Lounge").LeadIn().Phase(Off, 240, -0.5).Phase(On, 180, 1.0).Phase(Off, 120, -0.5).Build();
 
         var result = ThermalEstimator.Estimate([room], Settings);
@@ -77,8 +76,6 @@ public class ThermalEstimatorTests
         Assert.Equal(1, e.HeatingPeriods);
         Assert.InRange(e.CoolingPerHour!.Value, 0.45, 0.55);
         Assert.InRange(e.HeatingPerHour!.Value, 0.9, 1.1);
-        Assert.InRange(result.OnToOffRatio!.Value, 0.45, 0.55);
-        Assert.InRange(result.MaxOffMinutes!.Value, 210, 240);
     }
 
     [Fact]
@@ -116,7 +113,6 @@ public class ThermalEstimatorTests
 
         Assert.Equal(1, e.CoolingPeriods);
         Assert.InRange(e.CoolingPerHour!.Value, 0.3, 0.45);
-        Assert.InRange(e.FallStartTemperature!.Value, 23.8, 24.1);
     }
 
     [Fact]
@@ -149,14 +145,14 @@ public class ThermalEstimatorTests
         var e = Assert.Single(result.Rooms);
 
         Assert.Equal(0, e.HeatingPeriods);
-        Assert.Null(result.OnToOffRatio);
-        Assert.NotNull(result.MaxOffMinutes);
+        Assert.Null(e.HeatingPerHour);
+        Assert.NotNull(e.CoolingPerHour);
     }
 
     [Fact]
     public void Heating_rate_is_the_median_of_the_rises()
     {
-        // Rises at 1, 4 and 2°C/h: the median (2) resists one odd cycle. Falls at 0.4°C/h → ratio 0.2.
+        // Rises at 1, 4 and 2°C/h: the median (2) resists one odd cycle.
         var room = new SeriesBuilder("Lounge").LeadIn()
             .Phase(Off, 300, -0.4).Phase(On, 120, 1.0)
             .Phase(Off, 180, -0.4).Phase(On, 60, 4.0)
@@ -171,7 +167,6 @@ public class ThermalEstimatorTests
         Assert.Equal(3, e.CoolingPeriods);
         Assert.InRange(e.HeatingPerHour!.Value, 1.8, 2.2);
         Assert.InRange(e.CoolingPerHour!.Value, 0.36, 0.44);
-        Assert.InRange(result.OnToOffRatio!.Value, 0.17, 0.23);
     }
 
     [Fact]
@@ -185,7 +180,7 @@ public class ThermalEstimatorTests
 
         Assert.Equal(1, e.CoolingPeriods);
         Assert.Equal(0, e.HeatingPeriods);
-        Assert.Null(result.OnToOffRatio);
+        Assert.Null(e.HeatingPerHour);
         Assert.Contains("no finished rise", e.Note);
     }
 
@@ -249,49 +244,35 @@ public class ThermalEstimatorTests
     }
 
     [Fact]
-    public void Worst_room_decides()
+    public void Rooms_are_measured_separately()
     {
         var mild = new SeriesBuilder("Mild").LeadIn().Phase(Off, 240, -0.25).Phase(On, 120, 2.0).Phase(Off, 60, -0.25).Build();
         var draughty = new SeriesBuilder("Draughty").LeadIn().Phase(Off, 240, -1.0).Phase(On, 120, 1.0).Phase(Off, 60, -1.0).Build();
 
-        var result = ThermalEstimator.Estimate([mild, draughty], Settings);
+        var rooms = ThermalEstimator.Estimate([mild, draughty], Settings).Rooms;
 
-        Assert.InRange(result.MaxOffMinutes!.Value, 90, 120);     // draughty: ~2°C / 1°C/h
-        Assert.InRange(result.OnToOffRatio!.Value, 0.9, 1.1);     // draughty: 1 / 1
+        Assert.Equal(["Mild", "Draughty"], rooms.Select(r => r.Key));
+        Assert.InRange(rooms[0].CoolingPerHour!.Value, 0.22, 0.28);
+        Assert.InRange(rooms[1].CoolingPerHour!.Value, 0.9, 1.1);
+        Assert.InRange(rooms[1].HeatingPerHour!.Value, 0.9, 1.1);
     }
 
     [Fact]
-    public void Max_off_is_rounded_down_to_whole_slots_and_clamped()
+    public void Warming_while_off_is_not_measurable_cooling()
     {
-        // ~2°C / 0.7°C/h ≈ 170 min → 150.
-        var room = new SeriesBuilder("A").LeadIn().Phase(Off, 240, -0.7).Phase(On, 60, 1.0).Build();
-        Assert.Equal(150, ThermalEstimator.Estimate([room], Settings).MaxOffMinutes);
-
-        // Very fast cooling → below the lower bound → 60.
-        var cold = new SeriesBuilder("B").LeadIn().Phase(Off, 120, -3.0).Phase(On, 60, 2.0).Build();
-        Assert.Equal(60, ThermalEstimator.Estimate([cold], Settings).MaxOffMinutes);
-
-        // Slow cooling (2°C at 0.05°C/h = 40h) → above the upper bound → 1440 (24h).
-        var slow = new SeriesBuilder("C").LeadIn().Phase(Off, 600, -0.05).Phase(On, 120, 1.0).Build();
-        Assert.Equal(1440, ThermalEstimator.Estimate([slow], Settings).MaxOffMinutes);
-    }
-
-    [Fact]
-    public void Fall_starting_below_minimum_gives_lower_bound()
-    {
-        var room = new SeriesBuilder("A").StartAt(20.5).LeadIn().Phase(Off, 120, -0.5).Phase(On, 60, 1.0).Build();
-        Assert.Equal(60, ThermalEstimator.Estimate([room], Settings).MaxOffMinutes);
+        var sunny = new SeriesBuilder("C").LeadIn().Phase(Off, 120, 0.3).Phase(On, 120, 1.0).Build();
+        Assert.Null(Assert.Single(ThermalEstimator.Estimate([sunny], Settings).Rooms).CoolingPerHour);
     }
 
     [Fact]
     public void Returns_nothing_without_enough_data()
     {
         var flat = new SeriesBuilder("A").Phase(Off, 240, -0.02).Phase(On, 120, 0.02).Build();
-        var result = ThermalEstimator.Estimate([flat], Settings);
+        var e = Assert.Single(ThermalEstimator.Estimate([flat], Settings).Rooms);
 
-        Assert.Null(result.MaxOffMinutes);
-        Assert.Null(result.OnToOffRatio);
-        Assert.Contains("no finished fall", Assert.Single(result.Rooms).Note);
+        Assert.Null(e.CoolingPerHour);
+        Assert.Null(e.HeatingPerHour);
+        Assert.Contains("no finished fall", e.Note);
     }
 
     [Fact]
@@ -307,7 +288,7 @@ public class ThermalEstimatorTests
 
         Assert.Equal(0, e.CoolingPeriods);
         Assert.Equal(0, e.HeatingPeriods);
-        Assert.Null(result.MaxOffMinutes);
+        Assert.Null(e.CoolingPerHour);
     }
 }
 
@@ -341,11 +322,12 @@ public class ThermalTunerTests
         }
     }
 
-    private static WavinRoom Room(string id, string title, string vacation = "VACATION_MODE_OFF") => new()
+    private static WavinRoom Room(string id, string title, string vacation = "VACATION_MODE_OFF", double? air = 21.5) => new()
     {
         Id = System.Text.Json.JsonSerializer.SerializeToElement(id),
         Title = title,
         VacationMode = vacation,
+        AirTemperature = air,
     };
 
     /// <summary>4h off cooling 1°C/h from 23°C, 1.5h on heating 2°C/h, then 1h off, as 5-minute rows ending at <see cref="Now"/>.</summary>
@@ -377,102 +359,109 @@ public class ThermalTunerTests
         return rows;
     }
 
-    private static (ThermalTuner Service, HeatingSchedule Schedule) Create(FakeWavin wavin, WavinOptions? wavinOptions = null)
+    private static (ThermalTuner Service, HeatingSchedule Schedule) Create(
+        FakeWavin wavin, WavinOptions? wavinOptions = null, ScheduleOptions? scheduleOptions = null)
     {
-        var schedule = new HeatingSchedule(
-            TestHelpers.Opt(new ScheduleOptions { OnToOffRatio = 0.25, MaxOffMinutes = 600, MinOnMinutes = 60 }),
-            NullLogger<HeatingSchedule>.Instance);
+        var options = TestHelpers.Opt(scheduleOptions ?? new ScheduleOptions { MinTemperature = 20.5, CoolingRate = 0.15, HeatingRate = 0.15 });
+        var heating = TestHelpers.Opt(new HeatingOptions { OnTemperature = 23, OffTemperature = 16 });
+        var schedule = new HeatingSchedule(options, heating, NullLogger<HeatingSchedule>.Instance);
         var service = new ThermalTuner(
             wavin, schedule,
-            TestHelpers.Opt(new TuningOptions { MinTemperature = 21 }),
+            TestHelpers.Opt(new TuningOptions()), options,
             TestHelpers.Opt(wavinOptions ?? new WavinOptions()),
-            TestHelpers.Opt(new HeatingOptions { OnTemperature = 23, OffTemperature = 16 }),
-            new FakeTimeProvider(Now),
+            heating, new FakeTimeProvider(Now),
             NullLogger<ThermalTuner>.Instance);
         return (service, schedule);
     }
 
     [Fact]
-    public async Task Applies_rules_worked_out_from_sentio_history()
+    public async Task Applies_rates_measured_from_sentio_history_and_reads_temperatures()
     {
-        var wavin = new FakeWavin(new() { ["1"] = CoolThenHeat() }, Room("1", "Lounge"));
+        var wavin = new FakeWavin(new() { ["1"] = CoolThenHeat() }, Room("1", "Lounge", air: 21.7));
         var (service, schedule) = Create(wavin);
 
         await service.RunOnceAsync(CancellationToken.None);
 
-        Assert.Equal(4, schedule.Rules.MaxOffSlots);         // (23 − 21) / 1°C/h = 2h
-        Assert.Equal(0.5, schedule.Rules.OnToOffRatio, 2);   // 1 / 2
-        Assert.Equal(2, schedule.Rules.MinOnSlots);          // unchanged
-
-        var call = Assert.Single(wavin.HistoryCalls);
-        Assert.Equal(("1", Now - TimeSpan.FromHours(84), Now, 5), call);
+        var room = Assert.Single(schedule.Rooms);
+        Assert.Equal("devices/1/1", room.Key);
+        Assert.Equal(1.0, room.CoolingPerHour, 2);
+        Assert.Equal(2.0, room.HeatingPerHour, 2);
+        Assert.Equal(21.7, room.Temperature);
+        Assert.Equal(("1", Now - TimeSpan.FromHours(84), Now, 5), Assert.Single(wavin.HistoryCalls));
     }
 
     [Fact]
-    public async Task Ignores_small_ratio_changes()
+    public async Task Applies_every_measured_rate_however_small_the_change()
     {
-        // Measured ratio 0.5; a current ratio within 10% of that is kept, avoiding re-plans on small wobbles.
         var wavin = new FakeWavin(new() { ["1"] = CoolThenHeat() }, Room("1", "Lounge"));
         var (service, schedule) = Create(wavin);
-        schedule.UpdateRules(0.47, 20);
+        schedule.UpdateRates([new RoomRates("devices/1/1", "Lounge", 0.99, 1.98)]);
 
         await service.RunOnceAsync(CancellationToken.None);
 
-        Assert.Equal(0.47, schedule.Rules.OnToOffRatio);
-        Assert.Equal(4, schedule.Rules.MaxOffSlots);
+        var room = Assert.Single(schedule.Rooms);
+        Assert.Equal(1.0, room.CoolingPerHour, 2);
+        Assert.NotEqual(0.99, room.CoolingPerHour);
+        Assert.Equal(2.0, room.HeatingPerHour, 2);
     }
 
     [Fact]
-    public async Task Keeps_configured_rules_without_usable_history()
+    public async Task Measurement_replaces_the_configured_rates()
+    {
+        var wavin = new FakeWavin(new() { ["1"] = CoolThenHeat() }, Room("1", "Lounge"));
+        var (service, schedule) = Create(wavin, scheduleOptions: new ScheduleOptions { MinTemperature = 20.5, CoolingRate = 0.95, HeatingRate = 1.9 });
+
+        await service.RunOnceAsync(CancellationToken.None);
+
+        var room = Assert.Single(schedule.Rooms);
+        Assert.Equal(1.0, room.CoolingPerHour, 2);
+        Assert.Equal(2.0, room.HeatingPerHour, 2);
+    }
+
+    [Fact]
+    public async Task Keeps_configured_rates_without_usable_history()
     {
         var wavin = new FakeWavin([], Room("1", "Lounge"));
         var (service, schedule) = Create(wavin);
 
         await service.RunOnceAsync(CancellationToken.None);
 
-        Assert.Equal(0.25, schedule.Rules.OnToOffRatio);
-        Assert.Equal(20, schedule.Rules.MaxOffSlots);
+        var room = Assert.Single(schedule.Rooms);
+        Assert.Equal((0.15, 0.15), (room.CoolingPerHour, room.HeatingPerHour));
     }
 
     [Fact]
     public async Task Works_after_the_on_and_off_temperatures_change()
     {
         // History recorded with 19°C off and 21°C on, while the settings now say 16 and 23: the rises and falls of the
-        // setpoint still say when the heating was on, so the result is the same as with matching temperatures.
+        // setpoint still say when the heating was on, so the rates are the same as with matching temperatures.
         var wavin = new FakeWavin(new() { ["1"] = CoolThenHeat(offSetpoint: 19, onSetpoint: 21) }, Room("1", "Lounge"));
         var (service, schedule) = Create(wavin);
 
         await service.RunOnceAsync(CancellationToken.None);
 
-        Assert.Equal(4, schedule.Rules.MaxOffSlots);
-        Assert.Equal(0.5, schedule.Rules.OnToOffRatio, 2);
+        var room = Assert.Single(schedule.Rooms);
+        Assert.Equal(1.0, room.CoolingPerHour, 2);
+        Assert.Equal(2.0, room.HeatingPerHour, 2);
     }
 
     [Fact]
-    public async Task Tunes_only_against_configured_tuning_rooms()
+    public async Task Tracks_only_the_schedule_rooms()
     {
         var wavin = new FakeWavin(
             new() { ["1"] = CoolThenHeat(), ["2"] = CoolThenHeat(), ["3"] = CoolThenHeat() },
             Room("1", "Lounge"), Room("2", "Kitchen"), Room("3", "Lobby"));
-        var schedule = new HeatingSchedule(
-            TestHelpers.Opt(new ScheduleOptions { OnToOffRatio = 0.25, MaxOffMinutes = 600, MinOnMinutes = 60 }),
-            NullLogger<HeatingSchedule>.Instance);
-        var service = new ThermalTuner(
-            wavin, schedule,
-            TestHelpers.Opt(new TuningOptions { MinTemperature = 21, Rooms = ["lobby"] }),
-            TestHelpers.Opt(new WavinOptions()),
-            TestHelpers.Opt(new HeatingOptions { OnTemperature = 23, OffTemperature = 16 }),
-            new FakeTimeProvider(Now),
-            NullLogger<ThermalTuner>.Instance);
+        var (service, schedule) = Create(wavin, scheduleOptions: new ScheduleOptions { MinTemperature = 20.5, Rooms = ["lobby"] });
 
         var result = await service.RunOnceAsync(CancellationToken.None);
 
         Assert.Equal(["3"], wavin.HistoryCalls.Select(c => c.RoomId));
         Assert.Equal("Lobby", Assert.Single(result.Rooms).Name);
+        Assert.Equal("Lobby", Assert.Single(schedule.Rooms).Name);
     }
 
     [Fact]
-    public async Task Uses_only_selected_rooms_not_on_vacation()
+    public async Task Skips_rooms_not_controlled_or_on_vacation()
     {
         var wavin = new FakeWavin(
             new() { ["1"] = CoolThenHeat(), ["2"] = CoolThenHeat(), ["3"] = CoolThenHeat() },

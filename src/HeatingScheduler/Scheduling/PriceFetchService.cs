@@ -6,8 +6,10 @@ namespace HeatingScheduler.Scheduling;
 
 /// <summary>
 /// Service 1: every 30 minutes, fetches all published Agile prices and hands them to <see cref="HeatingSchedule"/>.
-/// When new prices arrive (about once a day, and at startup) it re-tunes the rules with <see cref="ThermalTuner"/>.
-/// After each check it emails the plan if it has changed (<see cref="PlanNotifier"/>).
+/// Only when new prices arrive (about once a day, and at startup) does it re-measure the room rates with
+/// <see cref="ThermalTuner"/> (which also reads the current room temperatures) and email the plan
+/// (<see cref="PlanNotifier"/>). If either fails, it is retried at the next check. The plan itself is re-made hourly by
+/// <see cref="HeatingSchedule"/>, independently of this.
 /// </summary>
 public sealed class PriceFetchService(
     IOctopusAgileClient octopus,
@@ -22,6 +24,8 @@ public sealed class PriceFetchService(
 
     private bool _tuningDue = true;
     private TuningResult? _lastTuning;
+    private readonly List<string> _emailReasons = [];
+    private bool _emailDue;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -54,38 +58,64 @@ public sealed class PriceFetchService(
 
         var knownUntil = schedule.PricesKnownUntil(current);
         var rates = await octopus.GetRatesAsync(current, current + HeatingSchedule.MaxHorizon, cancellationToken);
+        var fetchedUntil = rates.Count > 0 ? rates.Max(r => r.ValidTo) : knownUntil;
+        var newPrices = fetchedUntil > knownUntil;
+        if (newPrices)
+        {
+            _tuningDue = true;
+            _emailDue = true;
+        }
+
+        // Rates and current temperatures first, so the plan made with the new prices starts from the real rooms.
+        if (_tuningDue)
+        {
+            var roomsBefore = schedule.Rooms;
+            try
+            {
+                if (tuner.Enabled)
+                {
+                    _lastTuning = await tuner.RunOnceAsync(cancellationToken);
+                }
+                else
+                {
+                    await tuner.RefreshTemperaturesAsync(cancellationToken);
+                }
+
+                _tuningDue = false;
+                if (!roomsBefore.Select(r => (r.Key, r.CoolingPerHour, r.HeatingPerHour))
+                        .SequenceEqual(schedule.Rooms.Select(r => (r.Key, r.CoolingPerHour, r.HeatingPerHour))))
+                {
+                    reasons.Add("room rates re-measured");
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogError(ex, "Failed to read room temperatures or measure room rates; will retry at the next price check");
+            }
+        }
+
         schedule.UpdatePrices(rates, now);
 
         var newKnownUntil = schedule.PricesKnownUntil(current);
         if (newKnownUntil > knownUntil)
         {
             logger.LogInformation("Agile prices now known until {Until} (UK)", Slots.Uk(newKnownUntil));
-            reasons.Add($"new Agile prices until {Slots.Uk(newKnownUntil)}");
-            _tuningDue = true;
+            reasons.Insert(0, $"new Agile prices until {Slots.Uk(newKnownUntil)}");
         }
         else
         {
             logger.LogDebug("No new Agile prices yet; known until {Until} (UK)", Slots.Uk(newKnownUntil));
         }
 
-        if (_tuningDue && tuner.Enabled)
+        _emailReasons.AddRange(reasons.Where(r => !_emailReasons.Contains(r)));
+        if (_emailDue && await notifier.NotifyAsync(_emailReasons, tuner.Enabled ? _lastTuning : null, cancellationToken))
         {
-            var rulesBefore = schedule.Rules;
-            try
-            {
-                _lastTuning = await tuner.RunOnceAsync(cancellationToken);
-                _tuningDue = false;
-                if (schedule.Rules != rulesBefore)
-                {
-                    reasons.Add("tuning updated the rules");
-                }
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                logger.LogError(ex, "Failed to work out heating rules from room temperatures; will retry at the next price check");
-            }
+            _emailDue = false;
+            _emailReasons.Clear();
         }
-
-        await notifier.NotifyIfChangedAsync(schedule.GetSnapshot(), reasons, tuner.Enabled ? _lastTuning : null, cancellationToken);
+        else if (!_emailDue)
+        {
+            _emailReasons.Clear();
+        }
     }
 }

@@ -7,35 +7,29 @@ public sealed record RoomReading(DateTimeOffset At, double AirTemperature, Heati
 
 public sealed record RoomSeries(string Key, string Name, IReadOnlyList<RoomReading> Readings);
 
-/// <param name="MinTemperature">Temperature every room should stay above during an off period.</param>
 /// <param name="CountFrom">
 /// Only rises and falls starting at or after this time are counted. Readings before it are context, used to confirm the
 /// turning points near the start of the window.
 /// </param>
-public sealed record TuningSettings(double MinTemperature, DateTimeOffset? CountFrom = null);
+public sealed record TuningSettings(DateTimeOffset? CountFrom = null);
 
 /// <summary>What was measured for one room. Rates are in °C per hour; null means it could not be measured.</summary>
 public sealed record RoomEstimate(
+    string Key,
     string Name,
     int CoolingPeriods,
-    double? FallStartTemperature,
     double? CoolingPerHour,
-    double? MaxOffMinutes,
     int HeatingPeriods,
     double? HeatingPerHour,
-    double? OnToOffRatio,
     string? Note);
 
-/// <summary>
-/// The combined result: the most restrictive room decides. Null values mean "not enough data; keep the current value".
-/// </summary>
-public sealed record TuningResult(double? OnToOffRatio, int? MaxOffMinutes, IReadOnlyList<RoomEstimate> Rooms);
+public sealed record TuningResult(IReadOnlyList<RoomEstimate> Rooms);
 
 /// <summary>
-/// Works out the maximum off period and the make-up ratio from recorded room temperatures, measuring between the
-/// temperature's turning points rather than between switching times. With underfloor heating the air temperature keeps
-/// falling for a while after the heating comes on (and rising after it goes off); measuring from the turning points
-/// leaves that lag out.
+/// Works out each room's cooling rate (heating off) and heating rate (heating on) from recorded temperatures, measuring
+/// between the temperature's turning points rather than between switching times. With underfloor heating the air
+/// temperature keeps falling for a while after the heating comes on (and rising after it goes off); measuring from the
+/// turning points leaves that lag out.
 /// <list type="number">
 /// <item><b>Turning points:</b> the readings are smoothed (median over <see cref="SmoothingWindow"/>), then a peak or
 /// trough is confirmed once the temperature has moved at least <see cref="MinSwing"/> back from it. Rises or falls
@@ -47,13 +41,9 @@ public sealed record TuningResult(double? OnToOffRatio, int? MaxOffMinutes, IRea
 /// Only movements between two confirmed turning points are used, so neither the one in progress nor one cut off by the
 /// start of the history window is measured.</item>
 /// <item><b>Rates:</b> each rise or fall is measured by a straight-line (least-squares) fit through its raw readings;
-/// the smoothed readings are only used to find the turning points. The heating and cooling rates are the medians over
-/// the counted rises and falls.</item>
-/// <item><b>Max off:</b> (median temperature at the start of the falls, from the fitted lines − minimum temperature) ÷
-/// cooling rate.</item>
-/// <item><b>Ratio:</b> cooling rate ÷ heating rate: the on time needed to put back the heat lost per minute off.</item>
+/// the heating and cooling rates are the medians over the counted rises and falls. A rate below
+/// <see cref="MinRatePerMinute"/> isn't measurable and is reported as null.</item>
 /// </list>
-/// Across rooms the shortest max off and the highest ratio are used, then kept within safety bounds.
 /// </summary>
 public static class ThermalEstimator
 {
@@ -72,12 +62,6 @@ public static class ThermalEstimator
     /// <summary>A fall counts as cooling when the heating was on for at most this fraction of it.</summary>
     public const double CoolingOnFraction = 0.3;
 
-    /// <summary>Range the maximum off period is kept within (minutes).</summary>
-    public const int MaxOffLowerBoundMinutes = 60, MaxOffUpperBoundMinutes = 1440;
-
-    /// <summary>Range the make-up ratio is kept within.</summary>
-    public const double RatioLowerBound = 0.05, RatioUpperBound = 3.0;
-
     /// <summary>Readings further apart than this are treated as a gap (e.g. the Wavin API was unreachable).</summary>
     public static readonly TimeSpan MaxGap = TimeSpan.FromMinutes(20);
 
@@ -88,26 +72,8 @@ public static class ThermalEstimator
 
     private readonly record struct Leg(int From, int To, bool IsRise, double RatePerMinute, double StartTemperature, double OnFraction, bool HasGap);
 
-    public static TuningResult Estimate(IReadOnlyList<RoomSeries> rooms, TuningSettings settings)
-    {
-        var estimates = rooms.Select(r => EstimateRoom(r, settings)).ToList();
-
-        var maxOffs = estimates.Where(e => e.MaxOffMinutes is not null).Select(e => e.MaxOffMinutes!.Value).ToList();
-        int? maxOff = maxOffs.Count == 0
-            ? null
-            : Math.Clamp(
-                // Round down to whole slots, allowing a minute of measurement noise (e.g. 239.9 min → 240).
-                (int)Math.Floor((Math.Min(maxOffs.Min(), MaxOffUpperBoundMinutes) + 1) / 30) * 30,
-                MaxOffLowerBoundMinutes,
-                MaxOffUpperBoundMinutes);
-
-        var ratios = estimates.Where(e => e.OnToOffRatio is not null).Select(e => e.OnToOffRatio!.Value).ToList();
-        double? ratio = ratios.Count == 0
-            ? null
-            : Math.Round(Math.Clamp(ratios.Max(), RatioLowerBound, RatioUpperBound), 3);
-
-        return new TuningResult(ratio, maxOff, estimates);
-    }
+    public static TuningResult Estimate(IReadOnlyList<RoomSeries> rooms, TuningSettings settings) =>
+        new(rooms.Select(r => EstimateRoom(r, settings)).ToList());
 
     private static RoomEstimate EstimateRoom(RoomSeries room, TuningSettings settings)
     {
@@ -119,8 +85,7 @@ public static class ThermalEstimator
         var rises = legs.Where(l => l.IsRise && l.OnFraction >= HeatingOnFraction).ToList();
 
         string? note = null;
-        double? coolingPerHour = null, fallStart = null, maxOffMinutes = null, heatingPerHour = null, ratio = null;
-        var coolingPerMinute = 0.0;
+        double? cooling = null, heating = null;
 
         if (falls.Count == 0)
         {
@@ -128,17 +93,14 @@ public static class ThermalEstimator
         }
         else
         {
-            coolingPerMinute = -Median(falls.Select(l => l.RatePerMinute));
-            coolingPerHour = coolingPerMinute * 60;
-            fallStart = Median(falls.Select(l => l.StartTemperature));
-            if (coolingPerMinute < MinRatePerMinute)
+            var perMinute = -Median(falls.Select(l => l.RatePerMinute));
+            if (perMinute < MinRatePerMinute)
             {
-                maxOffMinutes = double.PositiveInfinity;
                 note = "no measurable cooling";
             }
             else
             {
-                maxOffMinutes = Math.Max(0, (fallStart.Value - settings.MinTemperature) / coolingPerMinute);
+                cooling = perMinute * 60;
             }
         }
 
@@ -148,20 +110,18 @@ public static class ThermalEstimator
         }
         else
         {
-            var heatingPerMinute = Median(rises.Select(l => l.RatePerMinute));
-            heatingPerHour = heatingPerMinute * 60;
-            if (heatingPerMinute < MinRatePerMinute)
+            var perMinute = Median(rises.Select(l => l.RatePerMinute));
+            if (perMinute < MinRatePerMinute)
             {
                 note ??= "no measurable warming";
             }
-            else if (coolingPerMinute >= MinRatePerMinute)
+            else
             {
-                ratio = coolingPerMinute / heatingPerMinute;
+                heating = perMinute * 60;
             }
         }
 
-        return new RoomEstimate(
-            room.Name, falls.Count, fallStart, coolingPerHour, maxOffMinutes, rises.Count, heatingPerHour, ratio, note);
+        return new RoomEstimate(room.Key, room.Name, falls.Count, cooling, rises.Count, heating, note);
     }
 
     /// <summary>The rises and falls between consecutive confirmed turning points of the smoothed readings.</summary>

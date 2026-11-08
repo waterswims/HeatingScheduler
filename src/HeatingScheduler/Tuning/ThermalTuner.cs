@@ -7,15 +7,16 @@ using Microsoft.Extensions.Options;
 namespace HeatingScheduler.Tuning;
 
 /// <summary>
-/// Works out the make-up ratio and maximum off period from the Sentio's room temperature history
-/// (see <see cref="ThermalEstimator"/>) and applies them to the <see cref="HeatingSchedule"/>. Run by
-/// <see cref="PriceFetchService"/> whenever new prices arrive, so the plan is re-tuned once a day.
-/// When a value can't be measured, the current one (initially from <see cref="ScheduleOptions"/>) stays in force.
+/// Reads the tracked rooms' current temperatures and measures their cooling and heating rates from the Sentio's
+/// temperature history (see <see cref="ThermalEstimator"/>), and gives both to the <see cref="HeatingSchedule"/>. Run by
+/// <see cref="PriceFetchService"/> whenever new prices arrive, so the rates are re-measured once a day.
+/// When a rate can't be measured, the current one (initially from <see cref="ScheduleOptions"/>) stays in force.
 /// </summary>
 public sealed class ThermalTuner(
     IWavinClient wavin,
     HeatingSchedule schedule,
     IOptions<TuningOptions> tuningOptions,
+    IOptions<ScheduleOptions> scheduleOptions,
     IOptions<WavinOptions> wavinOptions,
     IOptions<HeatingOptions> heatingOptions,
     TimeProvider timeProvider,
@@ -33,75 +34,78 @@ public sealed class ThermalTuner(
     /// </summary>
     public static readonly TimeSpan Context = TimeSpan.FromHours(12);
 
-    /// <summary>A newly measured ratio is only applied when it differs from the current one by more than this fraction.</summary>
-    public const double RatioChangeThreshold = 0.1;
-
     private const double SetpointTolerance = 0.05;
 
     public bool Enabled => tuningOptions.Value.Enabled;
 
-    /// <summary>Fetches the room history, works out the rules and applies any change to the schedule.</summary>
+    /// <summary>Reads the tracked rooms' current temperatures and gives them to the schedule. Returns the devices read.</summary>
+    public async Task<IReadOnlyList<WavinDevice>> RefreshTemperaturesAsync(CancellationToken cancellationToken)
+    {
+        var devices = await wavin.GetDevicesAsync(cancellationToken);
+        var now = timeProvider.GetUtcNow();
+        var tracked = Tracked(devices);
+        schedule.UpdateTemperatures(tracked
+            .Where(x => x.Room.AirTemperature is not null)
+            .Select(x => new RoomTemperature(x.Key, x.Room.DisplayName, x.Room.AirTemperature!.Value, now)));
+        return devices;
+    }
+
+    /// <summary>Reads current temperatures, measures the rates from the room history and applies any change to the schedule.</summary>
     public async Task<TuningResult> RunOnceAsync(CancellationToken cancellationToken)
     {
-        var history = await FetchHistoryAsync(cancellationToken);
+        var devices = await RefreshTemperaturesAsync(cancellationToken);
+        var end = timeProvider.GetUtcNow();
+        var start = end - History - Context;
 
-        var settings = new TuningSettings(tuningOptions.Value.MinTemperature, CountFrom: timeProvider.GetUtcNow() - History);
-
-        var result = ThermalEstimator.Estimate(history, settings);
-        var current = schedule.Rules;
-        var ratio = result.OnToOffRatio is double measured
-            && Math.Abs(measured - current.OnToOffRatio) > RatioChangeThreshold * current.OnToOffRatio
-                ? measured
-                : current.OnToOffRatio;
-        var maxOffSlots = result.MaxOffMinutes is int m ? Slots.FromMinutes(m) : current.MaxOffSlots;
-
-        if (ratio.Equals(current.OnToOffRatio) && maxOffSlots == current.MaxOffSlots)
+        var series = new List<RoomSeries>();
+        foreach (var (key, room) in Tracked(devices))
         {
-            logger.LogDebug("Heating rules unchanged: ratio {Ratio}, max off {MaxOff} min. Rooms: {Rooms}",
-                ratio, maxOffSlots * 30, Describe(result.Rooms));
+            var device = key[..key.LastIndexOf('/')];
+            var rows = await wavin.GetRoomTimeSeriesAsync(device, room.IdText, start, end, BucketMinutes, cancellationToken);
+            series.Add(new RoomSeries(key, room.DisplayName, ClassifyBySetpointChanges(rows, heatingOptions.Value)));
+        }
+
+        var result = ThermalEstimator.Estimate(series, new TuningSettings(CountFrom: end - History));
+        var current = schedule.Rooms.ToDictionary(r => r.Key);
+        var updates = new List<RoomRates>();
+        var changes = new List<string>();
+        foreach (var e in result.Rooms)
+        {
+            var model = current.GetValueOrDefault(e.Key);
+            var cooling = e.CoolingPerHour;
+            var heating = e.HeatingPerHour;
+            if (cooling is not null || heating is not null)
+            {
+                updates.Add(new RoomRates(e.Key, e.Name, cooling, heating));
+                changes.Add(string.Create(CultureInfo.InvariantCulture,
+                    $"{e.Name}: cooling {model?.CoolingPerHour:0.000} → {cooling ?? model?.CoolingPerHour:0.000}°C/h, heating {model?.HeatingPerHour:0.000} → {heating ?? model?.HeatingPerHour:0.000}°C/h"));
+            }
+        }
+
+        if (updates.Count == 0)
+        {
+            logger.LogInformation("No room rates could be measured; keeping the current ones. {Rooms}", Describe(result.Rooms));
             return result;
         }
 
-        logger.LogInformation(
-            "Heating rules from room temperatures: on-to-off ratio {OldRatio} → {Ratio}, max off {OldMaxOff} → {MaxOff} min. Rooms: {Rooms}",
-            current.OnToOffRatio, ratio, current.MaxOffSlots * 30, maxOffSlots * 30, Describe(result.Rooms));
-        schedule.UpdateRules(ratio, maxOffSlots);
+        logger.LogInformation("Room rates from temperature history: {Changes}. Measured: {Rooms}",
+            string.Join("; ", changes), Describe(result.Rooms));
+        schedule.UpdateRates(updates);
         return result;
     }
 
-    /// <summary>
-    /// Fetches the last <see cref="History"/> (plus <see cref="Context"/>) of each room to tune against
-    /// (<see cref="TuningOptions.Rooms"/>, or every controlled room), and labels each reading on or off with
-    /// <see cref="ClassifyBySetpointChanges"/>.
-    /// </summary>
-    private async Task<IReadOnlyList<RoomSeries>> FetchHistoryAsync(CancellationToken cancellationToken)
+    private List<(string Key, WavinRoom Room)> Tracked(IReadOnlyList<WavinDevice> devices)
     {
-        var end = timeProvider.GetUtcNow();
-        var start = end - History - Context;
-        var heating = heatingOptions.Value;
-
-        var series = new List<RoomSeries>();
-        foreach (var device in await wavin.GetDevicesAsync(cancellationToken))
+        var tracked = WavinSelection.TrackedRooms(devices, wavinOptions.Value.Rooms, scheduleOptions.Value.Rooms).ToList();
+        if (tracked.Count == 0 && scheduleOptions.Value.Rooms.Count > 0)
         {
-            var controlled = WavinSelection.SelectRooms(device.Rooms, wavinOptions.Value.Rooms).Where(r => !r.IsInVacationMode).ToList();
-            var rooms = WavinSelection.SelectRooms(controlled, tuningOptions.Value.Rooms).ToList();
-            if (rooms.Count == 0 && tuningOptions.Value.Rooms.Count > 0)
-            {
-                logger.LogWarning(
-                    "None of the Tuning:Rooms ({Wanted}) are controlled rooms on {Device}. Controlled rooms: {Rooms}",
-                    string.Join(", ", tuningOptions.Value.Rooms), device.Name,
-                    string.Join(", ", controlled.Select(r => $"{r.DisplayName} (id {r.IdText})")));
-            }
-
-            foreach (var room in rooms)
-            {
-                var rows = await wavin.GetRoomTimeSeriesAsync(device.Name, room.IdText, start, end, BucketMinutes, cancellationToken);
-                var readings = ClassifyBySetpointChanges(rows, heating);
-                series.Add(new RoomSeries($"{device.Name}/{room.IdText}", room.DisplayName, readings));
-            }
+            logger.LogWarning(
+                "None of the Schedule:Rooms ({Wanted}) are controlled rooms. Controlled rooms: {Rooms}",
+                string.Join(", ", scheduleOptions.Value.Rooms),
+                string.Join(", ", WavinSelection.TrackedRooms(devices, wavinOptions.Value.Rooms, []).Select(x => $"{x.Room.DisplayName} (id {x.Room.IdText})")));
         }
 
-        return series;
+        return tracked;
     }
 
     /// <summary>
@@ -174,21 +178,13 @@ public sealed class ThermalTuner(
         if (r.CoolingPerHour is { } c)
         {
             parts.Add(string.Create(CultureInfo.InvariantCulture,
-                $"cooling {c:0.00}°C/h (median of {r.CoolingPeriods} fall{(r.CoolingPeriods == 1 ? "" : "s")}, from {r.FallStartTemperature:0.0}°C)"));
-            parts.Add(r.MaxOffMinutes is { } mo && double.IsFinite(mo)
-                ? string.Create(CultureInfo.InvariantCulture, $"max off {mo:0} min")
-                : "max off unlimited");
+                $"cooling {c:0.000}°C/h (median of {r.CoolingPeriods} fall{(r.CoolingPeriods == 1 ? "" : "s")})"));
         }
 
         if (r.HeatingPerHour is { } h)
         {
             parts.Add(string.Create(CultureInfo.InvariantCulture,
-                $"heating {h:0.00}°C/h (median of {r.HeatingPeriods} rise{(r.HeatingPeriods == 1 ? "" : "s")})"));
-        }
-
-        if (r.OnToOffRatio is { } ratio)
-        {
-            parts.Add(string.Create(CultureInfo.InvariantCulture, $"ratio {ratio:0.00}"));
+                $"heating {h:0.000}°C/h (median of {r.HeatingPeriods} rise{(r.HeatingPeriods == 1 ? "" : "s")})"));
         }
 
         if (r.Note is not null)

@@ -54,7 +54,17 @@ public class HeatingControlServiceTests
 
     private sealed class FakeSchedule(DesiredState state) : IHeatingSchedule
     {
-        public DesiredState GetDesiredState(DateTimeOffset utcNow) => state;
+        public List<RoomTemperature> Temperatures { get; } = [];
+        public bool TemperaturesBeforeDecision { get; private set; }
+
+        public void UpdateTemperatures(IEnumerable<RoomTemperature> temperatures) => Temperatures.AddRange(temperatures);
+
+        public DesiredState GetDesiredState(DateTimeOffset utcNow)
+        {
+            TemperaturesBeforeDecision = Temperatures.Count > 0;
+            return state;
+        }
+
         public void MarkFirstAttemptComplete() { }
         public Task WaitForFirstAttemptAsync(TimeSpan timeout, TimeProvider timeProvider, CancellationToken cancellationToken) => Task.CompletedTask;
     }
@@ -64,11 +74,13 @@ public class HeatingControlServiceTests
     private static readonly DateTimeOffset Now = DateTimeOffset.Parse("2026-11-04T12:10:00Z");
 
     private static HeatingControlService Create(
-        FakeWavin wavin, DesiredState desired, WavinOptions? wavinOptions = null, DateTimeOffset? now = null) =>
+        FakeWavin wavin, DesiredState desired, WavinOptions? wavinOptions = null, DateTimeOffset? now = null,
+        FakeSchedule? schedule = null, ScheduleOptions? scheduleOptions = null) =>
         new(
             wavin,
-            new FakeSchedule(desired),
+            schedule ?? new FakeSchedule(desired),
             TestHelpers.Opt(wavinOptions ?? new WavinOptions()),
+            TestHelpers.Opt(scheduleOptions ?? new ScheduleOptions()),
             TestHelpers.Opt(new HeatingOptions { OnTemperature = 21, OffTemperature = 17 }),
             new FakeTimeProvider(now ?? Now),
             NullLogger<HeatingControlService>.Instance);
@@ -143,6 +155,23 @@ public class HeatingControlServiceTests
         var wavin = new FakeWavin(Device("devices/1", Room(1, "Lounge", 17)));
         await Create(wavin, new DesiredState(HeatingState.On, IsFallback: true)).RunOnceAsync(CancellationToken.None);
         Assert.Equal(21, Assert.Single(Assert.Single(wavin.Sent).Setpoints).SetpointTemperature);
+    }
+
+    [Fact]
+    public async Task Gives_the_schedule_the_tracked_rooms_temperatures_before_deciding()
+    {
+        var wavin = new FakeWavin(Device("devices/1",
+            Room(1, "Lounge", 21, air: 21.8),
+            Room(2, "Lobby", 21, air: 21.4),
+            Room(3, "Kitchen", 21, vacation: "VACATION_MODE_ON", air: 19.0)));
+        var schedule = new FakeSchedule(On);
+
+        await Create(wavin, On, schedule: schedule, scheduleOptions: new ScheduleOptions { Rooms = ["lobby", "kitchen"] })
+            .RunOnceAsync(CancellationToken.None);
+
+        Assert.True(schedule.TemperaturesBeforeDecision);
+        var t = Assert.Single(schedule.Temperatures);   // kitchen is on vacation, lounge isn't tracked
+        Assert.Equal(("devices/1/2", "Lobby", 21.4, Now), (t.Key, t.Name, t.Temperature, t.At));
     }
 
     [Theory]

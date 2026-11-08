@@ -7,12 +7,14 @@ namespace HeatingScheduler.Control;
 
 /// <summary>
 /// Service 2: checks the Wavin Sentio room setpoints and sets them to the on/off temperature
-/// required by the current slot of the <see cref="HeatingSchedule"/>.
+/// required by the current slot of the <see cref="HeatingSchedule"/>. Each check first gives the schedule the tracked
+/// rooms' current temperatures, which it compares with its prediction.
 /// </summary>
 public sealed class HeatingControlService(
     IWavinClient wavin,
     IHeatingSchedule schedule,
     IOptions<WavinOptions> wavinOptions,
+    IOptions<ScheduleOptions> scheduleOptions,
     IOptions<HeatingOptions> heatingOptions,
     TimeProvider timeProvider,
     ILogger<HeatingControlService> logger) : BackgroundService
@@ -66,6 +68,11 @@ public sealed class HeatingControlService(
     public async Task RunOnceAsync(CancellationToken cancellationToken)
     {
         var now = timeProvider.GetUtcNow();
+        var devices = await GetDevicesAsync(cancellationToken);
+        schedule.UpdateTemperatures(WavinSelection.TrackedRooms(devices, wavinOptions.Value.Rooms, scheduleOptions.Value.Rooms)
+            .Where(x => x.Room.AirTemperature is not null)
+            .Select(x => new RoomTemperature(x.Key, x.Room.DisplayName, x.Room.AirTemperature!.Value, now)));
+
         var desired = schedule.GetDesiredState(now);
         var target = heatingOptions.Value.TemperatureFor(desired.State);
 
@@ -83,7 +90,7 @@ public sealed class HeatingControlService(
             _lastDesired = desired;
         }
 
-        foreach (var device in await GetDevicesAsync(cancellationToken))
+        foreach (var device in devices)
         {
             var changes = new List<RoomSetpoint>();
             foreach (var room in SelectRooms(device.Rooms))

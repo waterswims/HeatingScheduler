@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using HeatingScheduler.Octopus;
 using HeatingScheduler.Options;
@@ -7,13 +8,33 @@ namespace HeatingScheduler.Scheduling;
 
 public sealed record DesiredState(HeatingState State, bool IsFallback);
 
-public sealed record PlannedSlot(DateTimeOffset Start, HeatingState State, decimal Price);
+/// <param name="StartTemperatures">Predicted temperature of each tracked room (by key) at the start of the slot.</param>
+/// <param name="LowestTemperature">Lowest predicted temperature of any tracked room at the end of the slot.</param>
+public sealed record PlannedSlot(
+    DateTimeOffset Start, HeatingState State, decimal Price,
+    IReadOnlyDictionary<string, double> StartTemperatures, double LowestTemperature);
 
-/// <summary>The current slot's decision, the plan after it, and the rules it was made with.</summary>
-public sealed record PlanSnapshot(DateTimeOffset? CurrentSlot, DesiredState? Current, IReadOnlyList<PlannedSlot> Upcoming, RatioRules Rules);
+/// <summary>A slot whose decision has been made: what was decided, its price, and the tracked rooms' measured temperatures when it started.</summary>
+public sealed record CommittedSlot(DateTimeOffset Start, DesiredState Decision, decimal? Price, IReadOnlyDictionary<string, double> MeasuredTemperatures);
+
+/// <summary>What the plan knows about a tracked room: its rates, and its last measured temperature.</summary>
+public sealed record RoomModel(string Key, string Name, double CoolingPerHour, double HeatingPerHour, double? Temperature, DateTimeOffset? MeasuredAt);
+
+/// <summary>The current slot's decision and price, the plan after it, and the room model it was made with.</summary>
+public sealed record PlanSnapshot(
+    DateTimeOffset? CurrentSlot, DesiredState? Current, decimal? CurrentPrice,
+    IReadOnlyList<PlannedSlot> Upcoming, IReadOnlyList<RoomModel> Rooms, double Floor);
+
+public sealed record RoomTemperature(string Key, string Name, double Temperature, DateTimeOffset At);
+
+/// <summary>Measured rates for a room; a null rate leaves the current one in place.</summary>
+public sealed record RoomRates(string Key, string Name, double? CoolingPerHour, double? HeatingPerHour);
 
 public interface IHeatingSchedule
 {
+    /// <summary>Records the latest measured temperatures of the tracked rooms.</summary>
+    void UpdateTemperatures(IEnumerable<RoomTemperature> temperatures);
+
     /// <summary>The state for the slot containing <paramref name="utcNow"/>. Fixed once decided.</summary>
     DesiredState GetDesiredState(DateTimeOffset utcNow);
 
@@ -23,12 +44,12 @@ public interface IHeatingSchedule
 }
 
 /// <summary>
-/// Thread-safe store of known prices and committed slot decisions, shared by both background services.
+/// Thread-safe store of prices, room temperatures and rates, and committed slot decisions, shared by the services.
 /// <para>
-/// When a slot starts, the solver plans over every known price (up to <see cref="MaxHorizon"/> ahead) from the actual
-/// history, and the first slot of that plan is committed. Committed slots never change. Because the plan always runs to
-/// the end of the known prices, it only changes when new prices arrive (about once a day), when the rules change, or
-/// after a restart.
+/// The plan is the cheapest on/off sequence over every known price that keeps each tracked room's predicted temperature
+/// above the minimum plus the safety margin (<see cref="TemperatureScheduleSolver"/>). When a slot starts, the planned
+/// decision is committed and never changes. The plan is re-made from the measured room temperatures at the start of
+/// every hour, so errors in the model are corrected, and also when the prices or the rates change, or after a restart.
 /// </para>
 /// </summary>
 public sealed class HeatingSchedule : IHeatingSchedule
@@ -39,71 +60,45 @@ public sealed class HeatingSchedule : IHeatingSchedule
     /// </summary>
     public static readonly TimeSpan MaxHorizon = TimeSpan.FromHours(48);
 
+    /// <summary>How long committed slots are kept, for the "what happened" part of the email.</summary>
+    public static readonly TimeSpan HistoryKept = TimeSpan.FromHours(72);
+
+    /// <summary>Temperatures older than this are not used to plan.</summary>
+    public static readonly TimeSpan MaxTemperatureAge = TimeSpan.FromHours(1);
+
     private static readonly TimeSpan MaxCatchUp = TimeSpan.FromHours(24);
 
     private readonly ScheduleOptions _options;
+    private readonly ThermalLimits _limits;
     private readonly ILogger<HeatingSchedule> _logger;
-    private RatioRules _rules;
     private readonly Lock _lock = new();
     private readonly SortedDictionary<DateTimeOffset, decimal> _prices = [];
-
-    // Value of each make-up slot still owed when the plan ends. Fixed when new prices arrive (the average of the known
-    // prices then), so re-planning as slots pass gives the same plan rather than shifting with a moving average.
-    private decimal? _owedSlotPrice;
-    private readonly Dictionary<DateTimeOffset, DesiredState> _committed = [];
+    private readonly Dictionary<string, RoomTemperature> _temperatures = [];
+    private readonly Dictionary<string, RoomRates> _rates = [];
+    private readonly SortedDictionary<DateTimeOffset, CommittedSlot> _committed = [];
     private readonly TaskCompletionSource _firstAttempt = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    private DateTimeOffset? _nextSlot;          // first slot without a committed decision
-    private HeatingHistory _history;            // history at the start of _nextSlot
-    private IReadOnlyList<PlannedSlot> _plan = []; // current plan from _nextSlot onwards
-    private IReadOnlyList<PlannedSlot> _lastLoggedPlan = [];
+    // Value of each slot of heat left in the rooms at the end of the plan. Fixed when new prices arrive (the average of
+    // the known prices then), so re-planning as slots pass doesn't shift with a moving average.
+    private decimal _storedHeatPrice;
 
-    public HeatingSchedule(IOptions<ScheduleOptions> options, ILogger<HeatingSchedule> logger)
+    private DateTimeOffset? _nextSlot;               // first slot without a committed decision
+    private int _onRun;                              // slots the heating has been on at the start of _nextSlot (0 = off)
+    private IReadOnlyList<PlannedSlot> _plan = [];   // plan from _nextSlot onwards
+    private IReadOnlyList<PlannedSlot> _lastLoggedPlan = [];
+    private DateTimeOffset _now = DateTimeOffset.MinValue;
+
+    public HeatingSchedule(IOptions<ScheduleOptions> options, IOptions<HeatingOptions> heating, ILogger<HeatingSchedule> logger)
     {
         _options = options.Value;
-        _rules = new RatioRules(
-            _options.OnToOffRatio,
-            Slots.FromMinutes(_options.MinOnMinutes),
-            Slots.FromMinutes(_options.MaxOffMinutes));
+        _limits = new ThermalLimits(
+            _options.Floor, heating.Value.OnTemperature, heating.Value.OffTemperature, Slots.FromMinutes(_options.MinOnMinutes));
         _logger = logger;
     }
 
-    /// <summary>
-    /// History assumed after a restart, when the real history is unknown: the heating has been on for the
-    /// minimum on-block with no heat left to make up, so the solver is free to switch off straight away.
-    /// </summary>
-    public HeatingHistory StartupHistory => HeatingHistory.On(_rules.MinOnSlots);
+    public ThermalLimits Limits => _limits;
 
-    /// <summary>The rules currently in force (initially from <see cref="ScheduleOptions"/>, then as tuned).</summary>
-    public RatioRules Rules
-    {
-        get
-        {
-            lock (_lock)
-            {
-                return _rules;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Replaces the make-up ratio and maximum off period (e.g. from measured room temperatures) and re-plans.
-    /// Decisions already committed are unaffected.
-    /// </summary>
-    public void UpdateRules(double onToOffRatio, int maxOffSlots)
-    {
-        lock (_lock)
-        {
-            _rules = _rules with { OnToOffRatio = onToOffRatio, MaxOffSlots = maxOffSlots };
-            if (_nextSlot is { } next)
-            {
-                _plan = PlanFrom(next);
-                LogPlanIfChanged();
-            }
-        }
-    }
-
-    /// <summary>The plan for slots after the current one (for logging and tests).</summary>
+    /// <summary>The plan for slots after the current one.</summary>
     public IReadOnlyList<PlannedSlot> Plan
     {
         get
@@ -115,18 +110,40 @@ public sealed class HeatingSchedule : IHeatingSchedule
         }
     }
 
-    /// <summary>A consistent snapshot of the current decision, the plan after it and the rules in force.</summary>
+    /// <summary>The room model: every room with a temperature or measured rates.</summary>
+    public IReadOnlyList<RoomModel> Rooms
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return RoomModels();
+            }
+        }
+    }
+
+    /// <summary>The committed slots starting in [<paramref name="from"/>, <paramref name="to"/>), oldest first.</summary>
+    public IReadOnlyList<CommittedSlot> History(DateTimeOffset from, DateTimeOffset to)
+    {
+        lock (_lock)
+        {
+            return _committed.Values.Where(c => c.Start >= from && c.Start < to).ToList();
+        }
+    }
+
+    /// <summary>A consistent snapshot of the current decision, the plan after it and the room model.</summary>
     public PlanSnapshot GetSnapshot()
     {
         lock (_lock)
         {
             if (_nextSlot is not { } next)
             {
-                return new PlanSnapshot(null, null, [], _rules);
+                return new PlanSnapshot(null, null, null, [], RoomModels(), _limits.Floor);
             }
 
             var current = next - Slots.Length;
-            return new PlanSnapshot(current, _committed.GetValueOrDefault(current), _plan, _rules);
+            var committed = _committed.GetValueOrDefault(current);
+            return new PlanSnapshot(current, committed?.Decision, committed?.Price, _plan, RoomModels(), _limits.Floor);
         }
     }
 
@@ -145,26 +162,60 @@ public sealed class HeatingSchedule : IHeatingSchedule
         }
     }
 
+    public void UpdateTemperatures(IEnumerable<RoomTemperature> temperatures)
+    {
+        lock (_lock)
+        {
+            foreach (var t in temperatures)
+            {
+                _temperatures[t.Key] = t;
+                _now = t.At > _now ? t.At : _now;
+            }
+        }
+    }
+
+    /// <summary>Applies measured rates (null rates leave the current value) and re-makes the plan.</summary>
+    public void UpdateRates(IEnumerable<RoomRates> rates)
+    {
+        lock (_lock)
+        {
+            foreach (var r in rates)
+            {
+                var current = _rates.GetValueOrDefault(r.Key);
+                _rates[r.Key] = new RoomRates(r.Key, r.Name, r.CoolingPerHour ?? current?.CoolingPerHour, r.HeatingPerHour ?? current?.HeatingPerHour);
+            }
+
+            Replan();
+        }
+    }
+
     public void UpdatePrices(IEnumerable<AgileSlot> slots, DateTimeOffset utcNow)
     {
         lock (_lock)
         {
-            var endBefore = _prices.Count > 0 ? _prices.Keys.Last() : DateTimeOffset.MinValue;
+            _now = utcNow > _now ? utcNow : _now;
+            var changed = false;
             foreach (var slot in slots)
             {
+                changed |= !_prices.TryGetValue(slot.ValidFrom, out var existing) || existing != slot.PriceIncVat;
                 _prices[slot.ValidFrom] = slot.PriceIncVat;
             }
 
             var current = Slots.StartFor(utcNow);
             var future = _prices.Where(p => p.Key >= current).Select(p => p.Value).ToList();
-            if (future.Count > 0 && (_owedSlotPrice is null || _prices.Keys.Last() > endBefore))
+            if (changed && future.Count > 0)
             {
-                _owedSlotPrice = future.Average();
+                _storedHeatPrice = future.Average();
             }
 
             CommitUpTo(utcNow);
-            _plan = PlanFrom(_nextSlot!.Value);
-            LogPlanIfChanged();
+
+            // Only when the prices changed: re-planning from a measurement taken part-way through a slot would otherwise
+            // nudge the plan, and send an email, every half hour.
+            if (changed)
+            {
+                Replan();
+            }
         }
     }
 
@@ -172,12 +223,13 @@ public sealed class HeatingSchedule : IHeatingSchedule
     {
         lock (_lock)
         {
+            _now = utcNow > _now ? utcNow : _now;
             CommitUpTo(utcNow);
 
             // If the clock stepped back to before the first decision, use the most recent decision.
-            return _committed.TryGetValue(Slots.StartFor(utcNow), out var decision)
-                ? decision
-                : _committed[_nextSlot!.Value - Slots.Length];
+            return _committed.TryGetValue(Slots.StartFor(utcNow), out var slot)
+                ? slot.Decision
+                : _committed[_nextSlot!.Value - Slots.Length].Decision;
         }
     }
 
@@ -196,6 +248,20 @@ public sealed class HeatingSchedule : IHeatingSchedule
         }
     }
 
+    private void Replan()
+    {
+        if (_nextSlot is { } next)
+        {
+            var plan = PlanFrom(next);
+            if (plan.Count > 0 || _plan.Count == 0)
+            {
+                _plan = plan;
+            }
+
+            LogPlanIfChanged();
+        }
+    }
+
     /// <summary>Commits decisions for every slot up to and including the one containing <paramref name="utcNow"/>.</summary>
     private void CommitUpTo(DateTimeOffset utcNow)
     {
@@ -204,45 +270,54 @@ public sealed class HeatingSchedule : IHeatingSchedule
         {
             if (_nextSlot is not null)
             {
-                _logger.LogWarning("No decisions made since {Slot}; restarting from the startup assumption", Slots.Uk(_nextSlot.Value));
+                _logger.LogWarning("No decisions made since {Slot}; starting afresh", Slots.Uk(_nextSlot.Value));
             }
 
+            // After a restart the heating's recent history is unknown: treat any minimum on-block as done.
             _nextSlot = current;
-            _history = StartupHistory;
-            _logger.LogInformation("Starting schedule at {Slot} assuming the heating was {History}", Slots.Uk(current), _history);
+            _onRun = _limits.MinOnSlots;
+            _plan = [];
+            _logger.LogInformation("Starting schedule at {Slot}", Slots.Uk(current));
         }
 
         var committedAny = false;
         while (_nextSlot <= current)
         {
             var slot = _nextSlot.Value;
-            var plan = PlanFrom(slot);
+            var planned = _plan.Count > 0 && _plan[0].Start == slot ? _plan[0] : null;
+            if (planned is null || slot.UtcDateTime.Minute == 0)
+            {
+                // On the hour, re-make the plan from the measured temperatures. Without fresh ones, keep following the plan.
+                var plan = PlanFrom(slot);
+                if (plan.Count > 0 || planned is null)
+                {
+                    _plan = plan;
+                }
+            }
+
             DesiredState decision;
-            if (plan.Count == 0)
+            if (_plan.Count == 0)
             {
                 decision = new DesiredState(_options.FallbackState, IsFallback: true);
-                if (decision.State == HeatingState.Off && !_rules.CanBeOff(_history))
-                {
-                    _logger.LogWarning("Fallback state Off at {Slot} breaks the scheduling rules ({History})", Slots.Uk(slot), _history);
-                }
             }
             else
             {
-                decision = new DesiredState(plan[0].State, IsFallback: false);
+                decision = new DesiredState(_plan[0].State, IsFallback: false);
+                _plan = _plan.Skip(1).ToList();
             }
 
-            _committed[slot] = decision;
-            _history = _history.Advance(decision.State == HeatingState.On);
+            _committed[slot] = new CommittedSlot(
+                slot, decision, _prices.TryGetValue(slot, out var price) ? price : null,
+                FreshTemperatures().ToDictionary(kv => kv.Key, kv => kv.Value.Temperature));
+            _onRun = decision.State == HeatingState.On ? Math.Min(_onRun + 1, _limits.MinOnSlots) : 0;
             _nextSlot = slot + Slots.Length;
-            _plan = plan.Count > 0 ? plan.Skip(1).ToList() : [];
             committedAny = true;
-            _logger.LogDebug("Committed {Slot}: {State}{Fallback}; now {History}",
-                Slots.Uk(slot), decision.State, decision.IsFallback ? " (fallback)" : "", _history);
+            _logger.LogDebug("Committed {Slot}: {State}{Fallback}", Slots.Uk(slot), decision.State, decision.IsFallback ? " (fallback)" : "");
         }
 
         if (committedAny)
         {
-            foreach (var old in _committed.Keys.Where(k => k < current - MaxCatchUp).ToList())
+            foreach (var old in _committed.Keys.Where(k => k < current - HistoryKept).ToList())
             {
                 _committed.Remove(old);
             }
@@ -256,22 +331,68 @@ public sealed class HeatingSchedule : IHeatingSchedule
         }
     }
 
-    /// <summary>Solves the schedule from <paramref name="from"/> over the known prices within the horizon, starting from the current history.</summary>
+    private Dictionary<string, RoomTemperature> FreshTemperatures() =>
+        _temperatures.Values.Where(t => t.At >= _now - MaxTemperatureAge).ToDictionary(t => t.Key);
+
+    private List<RoomModel> RoomModels() =>
+        _temperatures.Keys.Union(_rates.Keys).Order().Select(key =>
+        {
+            var t = _temperatures.GetValueOrDefault(key);
+            var r = _rates.GetValueOrDefault(key);
+            return new RoomModel(
+                key, t?.Name ?? r!.Name,
+                r?.CoolingPerHour ?? _options.CoolingRate,
+                r?.HeatingPerHour ?? _options.HeatingRate,
+                t?.Temperature, t?.At);
+        }).ToList();
+
+    /// <summary>Plans from <paramref name="from"/> over the known prices, starting from the rooms' fresh measured temperatures.</summary>
     private List<PlannedSlot> PlanFrom(DateTimeOffset from)
     {
-        var end = from + MaxHorizon;
+        var fresh = FreshTemperatures();
+        if (fresh.Count == 0)
+        {
+            return [];
+        }
+
         var starts = new List<DateTimeOffset>();
         var prices = new List<decimal>();
-        for (var t = from; t < end && _prices.TryGetValue(t, out var price); t += Slots.Length)
+        for (var t = from; t < from + MaxHorizon && _prices.TryGetValue(t, out var price); t += Slots.Length)
         {
             starts.Add(t);
             prices.Add(price);
         }
 
-        var result = RatioScheduleSolver.Solve(prices, _history, _rules, _owedSlotPrice);
-        return starts
-            .Select((s, i) => new PlannedSlot(s, result.On[i] ? HeatingState.On : HeatingState.Off, prices[i]))
-            .ToList();
+        if (prices.Count == 0)
+        {
+            return [];
+        }
+
+        // Bring each measurement forward to the start of the plan, using the decision for the slot in between.
+        var models = RoomModels().Where(m => fresh.ContainsKey(m.Key)).ToList();
+        var between = _committed.GetValueOrDefault(from - Slots.Length)?.Decision;
+        var rooms = models.Select(m =>
+        {
+            var t = fresh[m.Key];
+            var hours = (from - t.At).TotalHours;
+            var temperature = t.Temperature;
+            if (hours > 0 && between is not null)
+            {
+                var room = new RoomState(m.Key, temperature, m.CoolingPerHour, m.HeatingPerHour);
+                var full = TemperatureScheduleSolver.Step(temperature, between.State == HeatingState.On, room, _limits);
+                temperature += (full - temperature) * Math.Min(1, hours / TemperatureScheduleSolver.SlotHours);
+            }
+
+            return new RoomState(m.Key, temperature, m.CoolingPerHour, m.HeatingPerHour);
+        }).ToList();
+        var result = TemperatureScheduleSolver.Solve(prices, rooms, _onRun, _limits, _storedHeatPrice);
+
+        return starts.Select((s, i) => new PlannedSlot(
+            s,
+            result.On[i] ? HeatingState.On : HeatingState.Off,
+            prices[i],
+            rooms.Select((r, k) => (r.Key, T: result.Temperatures[i][k])).ToDictionary(x => x.Key, x => x.T),
+            result.Temperatures[i + 1].Min())).ToList();
     }
 
     /// <summary>Logs the plan when it differs from the last logged one (ignoring slots that have since passed).</summary>
@@ -287,14 +408,18 @@ public sealed class HeatingSchedule : IHeatingSchedule
 
         _lastLoggedPlan = _plan;
         var on = _plan.Where(p => p.State == HeatingState.On).ToList();
+        var lowest = _plan.MinBy(p => p.LowestTemperature)!;
         _logger.LogInformation(
-            "Plan to {End} (UK): {Blocks}. On {OnHours:0.#}h of {TotalHours:0.#}h, avg on price {OnPrice:F2}p vs {AvgPrice:F2}p/kWh",
+            "Plan to {End} (UK): {Blocks}. On {OnHours:0.#}h of {TotalHours:0.#}h, avg on price {OnPrice:F2}p vs {AvgPrice:F2}p/kWh; lowest predicted {Lowest:0.00}°C at {LowestAt} (floor {Floor:0.0}°C)",
             Slots.Uk(_plan[^1].Start + Slots.Length),
             DescribeBlocks(_plan),
             on.Count / 2.0,
             _plan.Count / 2.0,
             on.Count > 0 ? on.Average(p => p.Price) : 0m,
-            _plan.Average(p => p.Price));
+            _plan.Average(p => p.Price),
+            lowest.LowestTemperature,
+            Slots.Uk(lowest.Start + Slots.Length),
+            _limits.Floor);
     }
 
     public static string DescribeBlocks(IReadOnlyList<PlannedSlot> plan)
@@ -317,7 +442,8 @@ public sealed class HeatingSchedule : IHeatingSchedule
             sb.Append(plan[i].State == HeatingState.On ? "ON " : "off ")
                 .Append(Slots.Uk(plan[i].Start))
                 .Append('–')
-                .Append(Slots.Uk(plan[j].Start + Slots.Length, "HH:mm"));
+                .Append(Slots.Uk(plan[j].Start + Slots.Length, "HH:mm"))
+                .Append(string.Create(CultureInfo.InvariantCulture, $" ({plan[j].LowestTemperature:0.0}°C)"));
             i = j + 1;
         }
 
